@@ -1,4 +1,4 @@
-"""#659 r7: incremental compaction leaves carry room under the trigger, not half the window."""
+"""#659 r7b: carry uses at most half the remaining compaction-trigger headroom."""
 
 import time
 
@@ -72,8 +72,11 @@ def test_one_leaf_soft_stop_delivers_carry_below_trigger(make, window):
     assert any(CARRY in row.get("content", "") for row in returned)
     overhead = engine._survival_host_overhead(messages, max(engine.last_prompt_tokens, engine._last_gate_tokens))
     assert overhead == HOST_OVERHEAD
-    assert count_messages_tokens(returned) + overhead <= (
-        engine.threshold_tokens - engine_module._USER_CARRY_TRIGGER_MARGIN_TOKENS)
+    assert count_messages_tokens(returned) + overhead <= engine.threshold_tokens
+    # est is not exposed by diagnostics; bound delivered size using the returned request without the packet.
+    request_without_packet = count_messages_tokens(returned) - status["delivered_tokens"] + overhead
+    assert 0 < status["delivered_tokens"] <= status["budget_tokens"]
+    assert status["delivered_tokens"] <= (engine.threshold_tokens - request_without_packet) // 2 + 1
     # The retained backlog is why a half-window target cannot deliver this packet.
     assert count_messages_tokens(returned) - status["delivered_tokens"] + overhead > window * 0.5
 
@@ -89,3 +92,18 @@ def test_unknown_threshold_keeps_half_window_budget(make, window):
     expected = max(0, min(64_000, int(window * 0.15), int(window * 0.5) - estimate))
     assert 0 < expected < int(window * 0.15)
     assert engine._last_user_carry["budget_tokens"] == expected
+
+
+@pytest.mark.parametrize("threshold", [0.75, 0.2])
+@pytest.mark.parametrize("share", [0.5, 0.0])
+def test_known_threshold_budget_uses_half_headroom(make, monkeypatch, threshold, share):
+    engine, _ = make(65_536)
+    engine.threshold_tokens = int(engine.context_length * threshold)
+    monkeypatch.setattr(engine_module, "_USER_CARRY_HEADROOM_SHARE", share, raising=False)
+    tail = [{"role": "assistant", "content": "x" * int(engine.threshold_tokens * 0.6 * 4)}]
+    engine._user_carry_parts([], "user", [], [], [], tail, tail, None, None)
+    estimate = count_message_tokens({"role": "user", "content": ""}) + count_messages_tokens(tail)
+    expected = max(0, min(64_000, int(engine.context_length * 0.15),
+                          int((engine.threshold_tokens - estimate) * share)))
+    assert engine._last_user_carry["budget_tokens"] == expected
+    assert expected == 0 if share == 0.0 else expected > 0

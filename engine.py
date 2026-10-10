@@ -449,12 +449,9 @@ def _summary_part_text(node) -> str:
     )
 
 
-# #659: the user-message carry packet and the omitted-summary manifest follow the summary parts. Both are
-# re-rendered from the store/DAG to be recognised, like summary parts. The budget is one complete request
-# under the compaction trigger minus a margin (half the window if the trigger is unknown),
-# and never more than min(64k, 15% of the window); these are code constants, not config keys.
+# #659: the packet takes at most half the room under the compaction trigger (half the window minus the request when unknown), so it at most doubles the compaction rate.
 _USER_CARRY_TARGET_SHARE, _USER_CARRY_WINDOW_SHARE, _USER_CARRY_MAX_TOKENS = 0.50, 0.15, 64_000
-_USER_CARRY_TRIGGER_MARGIN_TOKENS = 2_000
+_USER_CARRY_HEADROOM_SHARE = 0.5
 _USER_CARRY_PREFIX = "[Earlier user messages in this session, verbatim, for reference only"
 _USER_CARRY_HEADER_RE = re.compile(re.escape(_USER_CARRY_PREFIX) + r" \(store ids ([\d, ]+?)(?:; excerpt (\d+):(\d+)-(\d+))?\)")
 _OMITTED_SUMMARIES_PREFIX = "[Summary parts omitted for space:"
@@ -7997,11 +7994,13 @@ class LCMEngine(
                                                   max(int(self.last_prompt_tokens or 0), self._last_gate_tokens))
                    + (max(0, int(self._config.proactive_recall_budget_tokens or 0))
                       if self._config.proactive_recall_enabled and self._config.embeddings_enabled else 0))
-            target = int(window * _USER_CARRY_TARGET_SHARE)
-            # Fill room under the trigger minus a margin: incremental compaction never drops the request to half the window.
+            # The packet takes at most half the room under the trigger (half the window minus the request when unknown), so it at most doubles the compaction rate.
             if int(self.threshold_tokens or 0) > 0:
-                target = int(self.threshold_tokens) - _USER_CARRY_TRIGGER_MARGIN_TOKENS
-            budget = max(0, min(_USER_CARRY_MAX_TOKENS, int(window * _USER_CARRY_WINDOW_SHARE), target - est))
+                budget = max(0, min(_USER_CARRY_MAX_TOKENS, int(window * _USER_CARRY_WINDOW_SHARE),
+                                    int((self.threshold_tokens - est) * _USER_CARRY_HEADROOM_SHARE)))
+            else:
+                target = int(window * _USER_CARRY_TARGET_SHARE)
+                budget = max(0, min(_USER_CARRY_MAX_TOKENS, int(window * _USER_CARRY_WINDOW_SHARE), target - est))
             chosen, excerpt, used = [], None, 60
 
             def take(row) -> bool:  # False: the budget is spent (this row may be its one excerpt)

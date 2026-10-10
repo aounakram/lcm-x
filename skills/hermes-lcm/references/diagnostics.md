@@ -41,7 +41,6 @@ Cleanup apply is separately feature-gated. Never infer permission to enable it f
   vector revision matches the current posture; re-run `/lcm embed warmup` after any change.
 - Earlier user messages missing after a compaction: `lcm_status` reports the last assembly's
   carry packet as `user_carry` (`budget_tokens`, `delivered_tokens`, `entries`,
-  `excerpt_store_id`). `empty_no_room: true` means the request already reached the
-  post-compaction target (the compaction trigger minus a 2,000-token margin, or half the window when the
-  trigger is unknown), so the packet was left empty; the current objective is still shown. An excerpted message names
+  `excerpt_store_id`). `empty_no_room: true` means the request left no room under the
+  compaction trigger (or under half the window when the trigger is unknown), so the packet was left empty; the current objective is still shown. An excerpted message names
   its `lcm_expand store_id=... content_offset=...` recovery call.
