@@ -204,6 +204,8 @@ _SWEEP_ON_RC1 = {
 
 @pytest.mark.parametrize("cell", sorted(_SWEEP_ON_RC1))
 def test_t3_sweep_on_output_is_byte_identical_to_rc1(tmp_path, monkeypatch, summaries, cell):
+    # The pre-#659 golden bytes exclude carry; r7 can now deliver one on this formerly no-room path.
+    monkeypatch.setattr(lcm_engine, "_USER_CARRY_TRIGGER_MARGIN_TOKENS", 1_000_000)
     engine = _engine(tmp_path, monkeypatch, sweep=True)
     try:
         outputs: list = []

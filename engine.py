@@ -451,9 +451,10 @@ def _summary_part_text(node) -> str:
 
 # #659: the user-message carry packet and the omitted-summary manifest follow the summary parts. Both are
 # re-rendered from the store/DAG to be recognised, like summary parts. The budget is one complete request
-# under half the window (a code constant, not a config key; never above 2/3 of the compaction threshold),
-# and never more than min(64k, 15% of the window).
+# under the compaction trigger minus a margin (half the window if the trigger is unknown),
+# and never more than min(64k, 15% of the window); these are code constants, not config keys.
 _USER_CARRY_TARGET_SHARE, _USER_CARRY_WINDOW_SHARE, _USER_CARRY_MAX_TOKENS = 0.50, 0.15, 64_000
+_USER_CARRY_TRIGGER_MARGIN_TOKENS = 2_000
 _USER_CARRY_PREFIX = "[Earlier user messages in this session, verbatim, for reference only"
 _USER_CARRY_HEADER_RE = re.compile(re.escape(_USER_CARRY_PREFIX) + r" \(store ids ([\d, ]+?)(?:; excerpt (\d+):(\d+)-(\d+))?\)")
 _OMITTED_SUMMARIES_PREFIX = "[Summary parts omitted for space:"
@@ -7997,8 +7998,9 @@ class LCMEngine(
                    + (max(0, int(self._config.proactive_recall_budget_tokens or 0))
                       if self._config.proactive_recall_enabled and self._config.embeddings_enabled else 0))
             target = int(window * _USER_CARRY_TARGET_SHARE)
-            if int(self.threshold_tokens or 0) > 0:  # the default's headroom (50% under a 75% threshold) under any
-                target = min(target, int(self.threshold_tokens) * 2 // 3)  # threshold, or the carry re-triggers
+            # Fill room under the trigger minus a margin: incremental compaction never drops the request to half the window.
+            if int(self.threshold_tokens or 0) > 0:
+                target = int(self.threshold_tokens) - _USER_CARRY_TRIGGER_MARGIN_TOKENS
             budget = max(0, min(_USER_CARRY_MAX_TOKENS, int(window * _USER_CARRY_WINDOW_SHARE), target - est))
             chosen, excerpt, used = [], None, 60
 
