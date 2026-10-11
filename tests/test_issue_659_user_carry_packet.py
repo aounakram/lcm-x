@@ -119,7 +119,9 @@ def test_repeated_identical_requests_are_both_carried(make):
 
 def test_one_excerpt_at_the_aggregate_boundary_resolves_through_expand_and_externalization(make, monkeypatch):
     monkeypatch.setattr(engine_module, "_USER_CARRY_MAX_TOKENS", 600, raising=False)
-    engine = make()
+    # The ingest-protection placeholder path: large-output externalization (default on, #1013 part C) off, so the
+    # row stays inline with its data URI replaced by a ref and the packet must cut it.
+    engine = make(large_output_externalization_enabled=False)
     big = "BIG-HEAD " + "alpha " * 900 + DATA_URI + " " + "omega " * 900 + "BIG-TAIL"
     messages = [*_turn(0), *_turn(1), *_turn(2, big), *_history(6)[-12:],
                 {"role": "user", "content": "latest small request"}, {"role": "assistant", "content": "ok"}]
@@ -138,6 +140,19 @@ def test_one_excerpt_at_the_aggregate_boundary_resolves_through_expand_and_exter
     payload = json.loads(lcm_tools.lcm_expand({"externalized_ref": ref, "max_tokens": 100_000}, engine=engine))
     assert DATA_URI.split(",", 1)[1][:200] in payload["content"]
 
+
+def test_a_user_row_externalized_at_ingest_rides_the_packet_as_its_stub_and_expands_to_the_full_text(make, monkeypatch):
+    """#1013 part C defaults: a user row with a data URI is stored as one media_payload stub, which fits whole."""
+    monkeypatch.setattr(engine_module, "_USER_CARRY_MAX_TOKENS", 600, raising=False)
+    engine = make()
+    big = "BIG-HEAD " + "alpha " * 900 + DATA_URI + " " + "omega " * 900 + "BIG-TAIL"
+    messages = [*_turn(0), *_turn(1), *_turn(2, big), *_history(6)[-12:],
+                {"role": "user", "content": "latest small request"}, {"role": "assistant", "content": "ok"}]
+    _, carry = _generated(engine, _compact(engine, messages))
+    assert "[... excerpt:" not in carry and "BIG-HEAD" not in carry and engine._last_user_carry["excerpt_store_id"] is None
+    ref = re.search(r"\[Externalized payload: kind=media_payload; role=user;[^\]]*ref=([^;\]\s]+)", carry).group(1)
+    payload = json.loads(lcm_tools.lcm_expand({"externalized_ref": ref, "max_tokens": 100_000}, engine=engine))
+    assert payload["content"] == big
 
 def _host_merge(messages):
     """Hermes _merge_consecutive_users: consecutive user rows become one, joined by a blank line."""
