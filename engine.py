@@ -4765,15 +4765,17 @@ class LCMEngine(
     def _rotation_predecessor_session_ids(self, session_id: str, max_hops: int = 32) -> list[str]:
         """The recorded compression-boundary predecessors of ``session_id``, nearest first."""
         found: list[str] = []
+        seen = {session_id}
         current = session_id
         for _ in range(max_hops):
             try:
                 predecessor = self._store.read_metadata_json(self._rotation_predecessor_metadata_key(current))
             except Exception:
                 break
-            if not isinstance(predecessor, str) or not predecessor or predecessor == session_id or predecessor in found:
+            if not isinstance(predecessor, str) or not predecessor or predecessor in seen:
                 break
             found.append(predecessor)
+            seen.add(predecessor)
             current = predecessor
         return found
 
@@ -5665,7 +5667,13 @@ class LCMEngine(
             return []
         if self._user_carry_lineage_memo and self._user_carry_lineage_memo[0] == key:
             return self._user_carry_lineage_memo[1]
-        chain = [key[1], *self._rotation_predecessor_session_ids(key[1], max_hops=sys.maxsize)]
+        memo = self._user_carry_lineage_memo
+        if memo and memo[0][0] == key[0] and memo[0][1] in self._rotation_predecessor_session_ids(key[1], max_hops=1):
+            chain = [key[1], *memo[1]]  # a recorded chain never changes: one hop onto the previous session's chain
+            if key[1] in memo[1]:  # a cycle: fall back to the full walk, which stops at it
+                chain = [key[1], *self._rotation_predecessor_session_ids(key[1], max_hops=sys.maxsize)]
+        else:
+            chain = [key[1], *self._rotation_predecessor_session_ids(key[1], max_hops=sys.maxsize)]
         if len(chain) > 1:
             self._user_carry_lineage_memo = (key, chain)
         return chain
@@ -8101,6 +8109,7 @@ class LCMEngine(
           [highest-depth summary nodes first, then lower]
           [fresh tail messages]
         """
+        self._last_user_carry = {"delivered_tokens": 0}  # #659: no packet in this assembly unless one is built
         result = []
         emission_candidates: list[dict[str, Any]] = []
         summary_candidate: Optional[dict[str, Any]] = None
