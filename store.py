@@ -974,9 +974,9 @@ class MessageStore:
         owned, owned_args = owned_conversation_clause(self._conn, conversation_id)  # legacy NULL/padded ids too
         rows = self._conn.execute(
             f"""SELECT {_MESSAGE_SELECT_COLUMNS} FROM messages
-               WHERE session_id IN ({",".join("?" * len(session_ids))}) AND {owned}
+               WHERE session_id IN (SELECT value FROM json_each(?)) AND {owned}
                  AND role = 'user' AND store_id {op} ? ORDER BY store_id {order} LIMIT ?""",
-            (*session_ids, *owned_args, int(cursor), int(limit)),
+            (json.dumps(session_ids), *owned_args, int(cursor), int(limit)),
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 

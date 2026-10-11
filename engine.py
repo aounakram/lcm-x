@@ -453,8 +453,9 @@ def _summary_part_text(node) -> str:
 # #659: the packet takes at most half the room under the compaction trigger (half the window minus the request when unknown), so it at most doubles the compaction rate.
 _USER_CARRY_TARGET_SHARE, _USER_CARRY_WINDOW_SHARE, _USER_CARRY_MAX_TOKENS = 0.50, 0.15, 64_000
 _USER_CARRY_HEADROOM_SHARE = 0.5
+_USER_CARRY_SCAN_LIMIT = 2_000
 _USER_CARRY_PREFIX = "[Earlier user messages in this session, verbatim, for reference only"
-_USER_CARRY_HEADER_RE = re.compile(re.escape(_USER_CARRY_PREFIX) + r" \(store ids ([\d, ]+?)(?:; excerpt (\d+):(\d+)-(\d+))?\)")
+_USER_CARRY_HEADER_RE = re.compile(re.escape(_USER_CARRY_PREFIX) + r" \(store ids (\d+(?:, \d+)*)(?:; excerpt (\d+):(\d+)-(\d+))?\)")
 _OMITTED_SUMMARIES_PREFIX = "[Summary parts omitted for space:"
 
 
@@ -5674,13 +5675,13 @@ class LCMEngine(
         when re-rendered from the store/DAG byte for byte; anything else stays content."""
         if content.startswith("\n\n---\n\n" + _USER_CARRY_PREFIX, pos) and (
                 header := _USER_CARRY_HEADER_RE.match(content, pos + 7)):
-            ids = [int(value) for value in header.group(1).split(", ")]
-            excerpt = tuple(int(value) for value in header.group(2, 3, 4)) if header.group(2) else None
             try:
+                ids = [int(value) for value in header.group(1).split(", ")]
+                excerpt = tuple(int(value) for value in header.group(2, 3, 4)) if header.group(2) else None
                 rows, lineage = self._store.get_batch(ids), set(self._user_carry_lineage())
             except Exception:
                 return pos
-            conversation = (str(self._conversation_id or ""), "")
+            conversation = (str(self._conversation_id or ""), "")  # rows arrive normalized (store._row_to_dict)
             if all(rows.get(i, {}).get("role") == "user" and rows[i].get("session_id") in lineage
                    and str(rows[i].get("conversation_id") or "") in conversation for i in ids):
                 rendered = _render_user_carry([rows[i] for i in ids], excerpt)
@@ -7990,7 +7991,8 @@ class LCMEngine(
         boundary, lineage, window = int(self._last_compacted_store_id or 0), self._user_carry_lineage(), \
             int(self.context_length or 0)
         active = anchor_part[len(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX) + 1:] if anchor_part else None
-        key = (str(self._store.db_path), self._conversation_id, self._session_id, boundary, active, tuple(frontier))
+        key = (str(self._store.db_path), self._conversation_id, self._session_id, boundary, active, tuple(frontier),
+               int(self.context_length or 0), int(self.threshold_tokens or 0))
         if self._user_carry_cache is not None and self._user_carry_cache[0] == key:
             text, diagnostics = self._user_carry_cache[1:]
         else:
@@ -8033,11 +8035,19 @@ class LCMEngine(
                         and self._generated_context_carrier_remainder(row) is None
                         and not self._holds_verified_user_carry(row))
 
+            scan_capped = False
             def scan(newest=True):  # the lineage's real user rows of this conversation, a page at a time
-                cursor = boundary + 1 if newest else 0
+                nonlocal scan_capped
+                cursor, examined = (boundary + 1 if newest else 0), 0
                 while page := self._store.load_lineage_user_rows(lineage, self._conversation_id, cursor, 200,
                                                                  newest_first=newest):
-                    yield from (row for row in page if real(row))
+                    for row in page:
+                        examined += 1
+                        scan_capped |= examined >= _USER_CARRY_SCAN_LIMIT
+                        if real(row):
+                            yield row
+                        if examined >= _USER_CARRY_SCAN_LIMIT:
+                            return
                     if len(page) < 200:
                         return
                     cursor = int(page[-1]["store_id"])
@@ -8063,6 +8073,8 @@ class LCMEngine(
             text = _render_user_carry(chosen, excerpt) if chosen else ""
             diagnostics = {"budget_tokens": budget, "empty_no_room": budget <= 0, "entries": len(chosen),
                            "excerpt_store_id": excerpt[0] if excerpt else None}
+            if scan_capped:
+                diagnostics["scan_capped"] = True
             self._user_carry_cache = (key, text, diagnostics)
         # The cap is hard: a reused packet that no longer fits under it is left out of this assembly.
         if text and (summary_budget is None or tokens([*parts, *added, text]) <= summary_budget):
@@ -8358,13 +8370,18 @@ class LCMEngine(
             active_summary_node_ids.update(
                 part_keys[i][1] for i in kept_indexes if part_keys[i][1] is not None)
             if not stub_over_cap_tool_results and active_summary_node_ids:  # #659 (Q7: never on forced recovery)
-                selected_parts += self._user_carry_parts(
-                    result, summary_role, selected_parts,
-                    [key[1] for i, key in enumerate(part_keys) if key[1] is not None and i not in kept_indexes],
-                    [key[1] for key in part_keys if key[1] is not None], tail_selected,
-                    [*([system_msg] if system_msg is not None else []),
-                     *([retained_user_msg] if retained_user_msg is not None else []), *anchor_source],
-                    summary_budget, selected_parts[0] if part_keys[kept_indexes[0]] == (-1, None) else None)
+                try:  # the packet is optional: a failure omits it and never fails the assembly
+                    selected_parts += self._user_carry_parts(
+                        result, summary_role, selected_parts,
+                        [key[1] for i, key in enumerate(part_keys) if key[1] is not None and i not in kept_indexes],
+                        [key[1] for key in part_keys if key[1] is not None], tail_selected,
+                        [*([system_msg] if system_msg is not None else []),
+                         *([retained_user_msg] if retained_user_msg is not None else []), *anchor_source],
+                        summary_budget, selected_parts[0] if part_keys[kept_indexes[0]] == (-1, None) else None)
+                except Exception as exc:
+                    self._user_carry_cache = None
+                    self._last_user_carry = {"error": type(exc).__name__, "empty_no_room": False, "delivered_tokens": 0}
+                    logger.warning("LCM user carry failed (non-blocking): %s", type(exc).__name__)
             if selected_parts:
                 combined = "\n\n---\n\n".join(selected_parts)
                 if retained_user_msg is not None:
