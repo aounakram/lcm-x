@@ -2396,19 +2396,20 @@ class LCMEngine(
                     finally:
                         store.close()
                     _EMBEDDING_SCHEMA_READY.add(schema_key)
-            # #1186: once per process, prepare an uncached local model off the user's turn.
-            start_local_model_prepare(database_path, config)
             cached = getattr(self, "_lcm_embedding_provider_cache", None)
             breaker = getattr(cached[1], "breaker", None) if cached else None
+            maintenance_key = self._rollup_maintenance_key("embeddings")
+            owner = self._embedding_maintenance_owner
 
             def maintain() -> None:
                 run_incremental_embedding_pass(database_path, config, breaker=breaker)
 
-            _EMBEDDING_MAINTENANCE_SCHEDULER.schedule(
-                self._rollup_maintenance_key("embeddings"),
-                maintain,
-                owner=self._embedding_maintenance_owner,
-            )
+            def enqueue() -> None:
+                _EMBEDDING_MAINTENANCE_SCHEDULER.schedule(maintenance_key, maintain, owner=owner)
+
+            # Preparation completion queues catch-up on the same deduplicated worker.
+            start_local_model_prepare(database_path, config, on_ready=enqueue)
+            enqueue()
         except Exception:
             logger.warning(
                 "LCM could not schedule background incremental embedding",

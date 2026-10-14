@@ -534,6 +534,103 @@ def test_t12_one_prepare_thread_per_process(tmp_path, monkeypatch, prepare):
     assert maintenance_mod.local_model_state(second) == ("present", "") and peak[0] == 1
 
 
+def test_q33_prepare_success_requeues_catch_up(tmp_path, monkeypatch, fastembed, prepare, caplog):
+    """REGRESSION: preparation completion resumes a pass that exited model_preparing."""
+    import hermes_lcm.engine as engine_mod
+
+    home = _clear_lcm_env(monkeypatch, tmp_path)
+    release = threading.Event()
+    fake = fastembed(download=lambda: release.wait(10))
+    engine = _engine(tmp_path, home)
+    scheduled, pass_threads = [], []
+    scheduler = engine_mod._EMBEDDING_MAINTENANCE_SCHEDULER
+    real_schedule = scheduler.schedule
+    real_pass = engine_mod.run_incremental_embedding_pass
+
+    def schedule(key, job, **kwargs):
+        scheduled.append((key, threading.current_thread().name))
+        return real_schedule(key, job, **kwargs)
+
+    def run_pass(*args, **kwargs):
+        pass_threads.append(threading.current_thread().name)
+        return real_pass(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "schedule", schedule)
+    monkeypatch.setattr(engine_mod, "run_incremental_embedding_pass", run_pass)
+    db_path = engine._config.database_path
+    try:
+        node_id = str(engine._dag.add_node(SummaryNode(
+            session_id=SESSION, depth=0, summary="restored summary", created_at=1, latest_at=1,
+        )))
+        engine._store.append(SESSION, {"role": "user", "content": "restored user fact"})
+        engine._store.append(SESSION, {"role": "assistant", "content": "restored answer"})
+        with caplog.at_level(logging.DEBUG, logger=maintenance_mod.__name__):
+            engine.on_session_start(SESSION, platform="cli", context_length=200_000)
+            assert engine.drain_embedding_maintenance(timeout=10)
+            assert maintenance_mod.incremental_embedding_state(db_path)[0][1] == "model_preparing"
+            assert len(scheduled) == 1 and not fake.documents
+            release.set()
+            _join_prepare()
+            assert engine.drain_embedding_maintenance(timeout=10)
+        assert len(scheduled) == 2, "successful preparation must schedule one catch-up"
+        assert scheduled[0][0] == scheduled[1][0] == engine._rollup_maintenance_key("embeddings")
+        assert scheduled[1][1] == "lcm-embedding-prepare"
+        assert pass_threads == ["lcm-embedding-maintenance"] * 2
+        assert _summary_vectors(db_path).keys() == {node_id}
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM lcm_chunk_vectors").fetchone()[0] == 2
+        messages = [r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("model_preparing" in message for message in messages)
+        assert any("outcome=ran" in message for message in messages)
+    finally:
+        release.set()
+        _join_prepare()
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("succeeds", [False, True], ids=["failure", "repeat-success"])
+def test_q33_prepare_does_not_schedule_twice(tmp_path, monkeypatch, fastembed, prepare, succeeds):
+    """CONTROL: failure never requeues; repeated successful prepare requests do not enqueue."""
+    import hermes_lcm.engine as engine_mod
+
+    home = _clear_lcm_env(monkeypatch, tmp_path)
+    release = threading.Event()
+
+    def download():
+        assert release.wait(10)
+        if not succeeds:
+            raise OSError("offline control")
+
+    fastembed(download=download)
+    engine = _engine(tmp_path, home)
+    scheduler = engine_mod._EMBEDDING_MAINTENANCE_SCHEDULER
+    scheduled = []
+    real_schedule = scheduler.schedule
+
+    def schedule(key, job, **kwargs):
+        scheduled.append(key)
+        return real_schedule(key, job, **kwargs)
+
+    monkeypatch.setattr(scheduler, "schedule", schedule)
+    try:
+        engine.on_session_start(SESSION, platform="cli", context_length=200_000)
+        assert engine.drain_embedding_maintenance(timeout=10)
+        release.set()
+        _join_prepare()
+        assert engine.drain_embedding_maintenance(timeout=10)
+        count = len(scheduled)
+        if not succeeds:
+            assert count == 1
+        # The process-wide state permits only one successful prepare, even on repeat requests.
+        for _ in range(2):
+            assert maintenance_mod.start_local_model_prepare(engine._config.database_path, engine._config) is False
+        assert len(scheduled) == count
+    finally:
+        release.set()
+        _join_prepare()
+        engine.shutdown()
+
+
 def test_t13_no_batch_starts_after_the_catch_up_budget(tmp_path, monkeypatch):
     clock, starts = [0.0], []
 

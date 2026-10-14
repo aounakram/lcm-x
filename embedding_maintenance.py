@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,8 @@ _PREPARE: dict[str, tuple[str, str]] = {}
 # #1186: this process's prepare thread; while it is alive no other prepare starts, and another
 # model is admitted by a later trigger.
 _PREPARE_THREAD: threading.Thread | None = None
+# Completion enqueues use the same database/embeddings identity as the scheduler.
+_PREPARE_READY: dict[str, dict[str, Callable[[], None]]] = {}
 
 
 def database_identity(db_path: str | Path) -> str:
@@ -57,6 +60,8 @@ def incremental_embedding_state(db_path: str | Path) -> tuple[tuple[float, str] 
 
 def _record(db_path: str | Path, outcome: str, failure: str | None) -> None:
     global _FAILURES, _FAILURE_WARNED
+    logger.debug("LCM incremental embedding pass outcome=%s detail=%s",
+                 "ran" if "=" in outcome else outcome, outcome)
     with _STATE_LOCK:
         _LAST_PASS[database_identity(db_path)] = (time.time(), outcome)
         if failure is None:
@@ -94,7 +99,9 @@ def note_local_model_present(config: Any) -> None:
             _PREPARE[key] = ("present", "")
 
 
-def start_local_model_prepare(db_path: str | Path, config: Any) -> bool:
+def start_local_model_prepare(
+    db_path: str | Path, config: Any, *, on_ready: Callable[[], None] | None = None,
+) -> bool:
     """Start this process's one background prepare of the local model (#1186).
 
     The thread runs the warmup path, the only one allowed to download, and
@@ -102,12 +109,17 @@ def start_local_model_prepare(db_path: str | Path, config: Any) -> bool:
     it serves full text and reports degraded. A failure warns once; the next
     process start retries. Only one prepare runs per process: a model requested
     while another is preparing is admitted by a later trigger.
+    ``on_ready`` only enqueues maintenance; it must never run a pass inline.
     """
     global _PREPARE_THREAD
     key = _local_model_key(config)
     if key is None:
         return False
     with _STATE_LOCK:
+        state = _PREPARE.get(key)
+        if on_ready is not None and (state is None or state[0] == "preparing"):
+            if state is not None or _PREPARE_THREAD is None or not _PREPARE_THREAD.is_alive():
+                _PREPARE_READY.setdefault(key, {})[database_identity(db_path)] = on_ready
         if key in _PREPARE or (_PREPARE_THREAD is not None and _PREPARE_THREAD.is_alive()):
             return False
         _PREPARE[key] = ("preparing", "")
@@ -131,10 +143,17 @@ def _prepare_local_model(key: str, db_path: str | Path, config: Any) -> None:
     if isinstance(result, dict):
         with _STATE_LOCK:
             _PREPARE[key] = ("present", "")
+            callbacks = _PREPARE_READY.pop(key, {})
+        for enqueue in callbacks.values():
+            try:
+                enqueue()
+            except Exception:
+                logger.warning("LCM could not enqueue embedding catch-up after preparation", exc_info=True)
         return
     reason = str(result).rsplit("error: ", 1)[-1].strip()
     with _STATE_LOCK:
         _PREPARE[key] = ("unavailable", reason)
+        _PREPARE_READY.pop(key, None)
         first = not _FAILURE_WARNED
         _FAILURE_WARNED = True
     (logger.warning if first else logger.debug)(

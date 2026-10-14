@@ -395,7 +395,8 @@ def test_1063_b_uncached_warns_once_retries_and_preserves_ingest(
         assert last[1] == "auto_register_unavailable"
         assert calls == [False, False]
         assert _profiles(engine) == []
-        assert [r.levelno for r in caplog.records if r.name == maintenance_mod.__name__] == [
+        assert [r.levelno for r in caplog.records if r.name == maintenance_mod.__name__
+                and "pass skipped" in r.getMessage()] == [
             logging.WARNING, logging.DEBUG,
         ]
         assert _rows(engine, "SELECT COUNT(*) FROM messages")[0][0] > 0
@@ -739,7 +740,8 @@ def test_c_unavailable_provider_never_raises_counts_and_recovers(
             _drain(engine)
         _, after = maintenance_mod.incremental_embedding_state(engine._config.database_path)
         assert after == before + 2
-        levels = [r.levelno for r in caplog.records if r.name == maintenance_mod.__name__]
+        levels = [r.levelno for r in caplog.records if r.name == maintenance_mod.__name__
+                  and "pass skipped" in r.getMessage()]
         assert levels == [logging.WARNING, logging.DEBUG]
         assert _summary_vector_ids(engine) == []
         # Nothing reached a provider, so nothing is left uncertain.
