@@ -761,7 +761,7 @@ def test_t10_store_offline_then_recovers(fx, monkeypatch):
     writer makes the next call succeed.
 
     This SQLite build recreates -wal/-shm on a ``mode=ro`` open when the directory is
-    writable; builds that cannot (critic A1) are simulated with an unwritable directory.
+    writable; SQLite builds that cannot recreate them are simulated by making the directory unwritable.
     """
     reader = make_reader(fx, monkeypatch)
     ok, is_error, _ = call(reader, "lcm_grep", {"query": "heron"})

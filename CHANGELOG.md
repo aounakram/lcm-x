@@ -6,6 +6,8 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 
 ## Unreleased
 
+- New: `scripts/lcm_x_mcp.py` (`lcm-x mcp`), a read-only stdio MCP server for Claude Code over one Hermes store. It serves `lcm_recall`, `lcm_grep`, `lcm_expand`, `lcm_load_session` and `lcm_describe` with their production schemas and outputs, opens the store read-only per call and never writes it; results carry `store_uuid` and degraded-mode flags. Hermes now writes a `store_uuid` metadata row once per store (no schema-version change); its tool behaviour is otherwise unchanged. (#1192)
+
 ## v0.27.0 (summary quality)
 
 - Fix: the default summary-prefix sweep target is one leaf budget, capped at a quarter of the compaction threshold, so small windows no longer fill their threshold with summaries. Explicit targets are unchanged. In the deterministic 32K-window replay, compactions fall from 360 in rc3 to 78 (rc2: 116). (rc4)
