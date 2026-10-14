@@ -6,7 +6,7 @@ requires_hermes: ">=0.21.3"   # the plugin API floor (ctx.register_hook); matche
 # Local semantic recall is on by default (#1186): Hermes installs this into its
 # environment and keeps it across updates. onnxruntime comes transitively.
 pip_dependencies:
-  - "fastembed==0.8.0"
+  - fastembed==0.8.0
 provides_tools:
   - lcm_grep
   - lcm_recall

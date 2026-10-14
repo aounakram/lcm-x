@@ -5,7 +5,8 @@ uses fastembed with `BAAI/bge-small-en-v1.5`. `plugin.yaml` declares `fastembed=
 installs it and keeps it across updates. On the first start the model (about 130 MB) downloads on a
 background thread; no turn waits for it, and recall uses full text (`degraded: true`) until it is
 ready. To turn semantic retrieval off, set `LCM_EMBEDDINGS_ENABLED=false`: retrieval is then
-FTS-only, as before. The other providers below are explicit choices.
+FTS-only, as before. The other providers below are explicit choices, and each needs its own
+`LCM_EMBEDDING_MODEL`: the default model applies only to fastembed.
 
 **Offline hosts.** If the download fails, LCM-X logs one warning naming `/lcm doctor`, keeps
 serving full-text recall, and does not retry until the next start. The doctor's

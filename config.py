@@ -18,6 +18,9 @@ def _parse_pattern_list(raw: str) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
+# #1186: the local model used when the provider is fastembed and no model is set.
+DEFAULT_FASTEMBED_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+
 # Default lcm_recall RRF arm weights. Conservative down-weight of the weak FTS
 # arm (the LongMemEval harness will tune from here); summary/chunk vector arms
 # keep full say. See docs/retrieval-tools.md.
@@ -968,7 +971,9 @@ class LCMConfig:
     selective_compiler_enabled: bool = False
     selective_compiler_model: str = ""
     embedding_provider: str = "fastembed"
-    embedding_model: str = "BAAI/bge-small-en-v1.5"
+    # None = no model given: __post_init__ resolves it to the FastEmbed default when the
+    # provider is fastembed (#1186), else to empty; an explicit "" stays empty.
+    embedding_model: str | None = None
     # Content-aware chunk policy for the raw-history chunk corpus:
     # conversational (default) | heads | full. Unknown values degrade to the
     # default in the chunker's normalize_content_policy.
@@ -1058,6 +1063,16 @@ class LCMConfig:
     # Summariser prompt version (#646): 1 = original prompts and 2x output
     # ceiling; 2 = v2 prompts, focus directives in the policy, 3x ceiling.
     summary_prompt_version: int = 1
+
+    def __post_init__(self) -> None:
+        self._pair_default_embedding_model()
+
+    def _pair_default_embedding_model(self) -> None:
+        """#1186: the default model applies only with FastEmbed and when no model was given."""
+        if self.embedding_model is None:
+            provider = str(self.embedding_provider or "").strip().lower()
+            fastembed = provider in {"fastembed", "fast-embed"}
+            self.embedding_model = DEFAULT_FASTEMBED_EMBEDDING_MODEL if fastembed else ""
 
     @classmethod
     def from_env(cls) -> "LCMConfig":
@@ -1180,11 +1195,14 @@ class LCMConfig:
         _record("summary_prompt_version", source, warning)
 
         # Every other scalar LCM_* override is applied uniformly from the spec.
+        # The model starts unresolved and is paired with the env's provider afterwards.
+        c.embedding_model = None
         for spec in ENV_FIELD_SPECS:
             if spec.name in _SOURCE_TRACKED_ENV_FIELDS:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
+        c._pair_default_embedding_model()
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")

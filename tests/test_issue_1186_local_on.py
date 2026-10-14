@@ -1,6 +1,6 @@
 """#1186: local semantic recall is on by default and built in.
 
-T1-T7 of the #1186 spec. The FastEmbed model is a fake behind the real
+T1-T7 of the #1186 spec; T8-T10 of its round-1 fix. The FastEmbed model is a fake behind the real
 ``FastembedProvider`` (``_load_fastembed``), so no test downloads anything.
 """
 
@@ -399,3 +399,62 @@ def test_t7_doctor_readiness_line(tmp_path, monkeypatch, fastembed, state, statu
         assert check["status"] == status
     finally:
         engine.shutdown()
+
+
+# Round 1 (T8-T10): the default model pairs with fastembed only; the exact pin line; the eval arms stay explicit.
+@pytest.mark.parametrize("env, provider, model", [
+    ({"LCM_EMBEDDING_PROVIDER": "voyage"}, "voyage", ""),
+    ({"LCM_EMBEDDING_PROVIDER": "fastembed"}, "fastembed", MODEL),
+    ({"LCM_EMBEDDING_PROVIDER": "fast-embed"}, "fast-embed", MODEL),
+    ({}, "fastembed", MODEL),
+    ({"LCM_EMBEDDING_MODEL": "BAAI/bge-base-en-v1.5"}, "fastembed", "BAAI/bge-base-en-v1.5"),
+])
+def test_t8_default_model_pairs_with_fastembed_only(tmp_path, monkeypatch, env, provider, model):
+    _clear_lcm_env(monkeypatch, tmp_path)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    kwargs = {"LCM_EMBEDDING_PROVIDER": "embedding_provider", "LCM_EMBEDDING_MODEL": "embedding_model"}
+
+    for config in (LCMConfig.from_env(), LCMConfig(**{kwargs[key]: value for key, value in env.items()})):
+        assert (config.embedding_provider, config.embedding_model) == (provider, model)
+
+    if not model:
+        # Any other provider with no model keeps the pre-#1186 missing-model path and message.
+        with pytest.raises(provider_mod.ProviderUnavailable, match="must both be set"):
+            provider_mod.resolve_provider(LCMConfig.from_env())
+
+
+def test_t9_plugin_yaml_carries_the_exact_pin_line():
+    manifest = (REPO_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+
+    assert "  - fastembed==0.8.0" in manifest.splitlines()
+    assert _manifest_dependencies()[1] == ["fastembed==0.8.0"]
+    try:
+        import yaml
+    except ImportError:  # the CI venv has no PyYAML; Hermes parses the manifest with it
+        return
+    assert yaml.safe_load(manifest)["pip_dependencies"] == ["fastembed==0.8.0"]
+
+
+@pytest.mark.parametrize("env", [
+    {},
+    {"LCM_EMBEDDING_PROVIDER": "fastembed"},
+    {"LCM_EMBEDDING_MODEL": MODEL},
+])
+def test_t10_eval_live_provider_requires_both_keys(tmp_path, monkeypatch, env):
+    import importlib.util
+
+    _clear_lcm_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("LCM_RECALL_EVAL_ALLOW_LIVE_PROVIDER", "1")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    # The config default is on, so without the guard from_env would hand the eval a semantic arm.
+    assert LCMConfig.from_env().embedding_model == MODEL
+    spec = importlib.util.spec_from_file_location(
+        "eval_retrieval_recall_t10", REPO_ROOT / "scripts" / "eval_retrieval_recall.py"
+    )
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    with pytest.raises(RuntimeError, match=r"^LCM_EMBEDDING_PROVIDER and LCM_EMBEDDING_MODEL are required$"):
+        script._load_live_provider()
