@@ -233,6 +233,9 @@ def _answer_ready_baseline(active_engine, question: str, payload: dict):
             "scope_bias": 0.0,
             "include_occurrence_time": True,
         },
+        min_sessions=0,
+        session_hints=False,
+        recall_guidance="v1",
     )
     recalled = json.loads(raw) if isinstance(raw, str) else raw
     hits = recalled.get("hits") if isinstance(recalled, dict) else None

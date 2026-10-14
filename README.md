@@ -52,6 +52,17 @@ What we are building and why: [VISION.md](VISION.md). What ships when:
 - [Contributing](#contributing)
 - [License](#license)
 
+### Recall breadth evaluation for v0.28
+
+Four recall levers are under evaluation; their effects are off by default.
+`LCM_RECALL_MIN_SESSIONS=0` disables the session floor (0..10; per-call
+`min_sessions` overrides it). `LCM_RECALL_SESSION_HINTS=false` disables
+session-window hints. `LCM_RECALL_GUIDANCE=v1` keeps today's descriptions;
+`v2` enables both multi-session guidance and the fourth lever, continuation
+signals in `answer_ready` provenance. Default recall output is unchanged.
+The additive `lcm_load_session` anchor parameters are always available.
+See [retrieval tools](docs/retrieval-tools.md#recall-breadth-evaluation-v028).
+
 ## What it does
 
 Hermes Agent's built-in compressor is a practical continuity layer: when the

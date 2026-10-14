@@ -6,6 +6,8 @@ including the `v1.0.0-beta.*` prereleases, have none. GitHub Releases are publis
 
 ## Unreleased
 
+- Add: opt-in recall levers under evaluation for v0.28: session breadth (`LCM_RECALL_MIN_SESSIONS=0`), session-window hints (`LCM_RECALL_SESSION_HINTS=false`), and shared multi-session tool guidance plus continuation signals (`LCM_RECALL_GUIDANCE=v1`; opt in with `v2`). All effects default off; recall output under defaults is unchanged. `lcm_load_session` also accepts an exact anchor and bounded before/after windows, with existing cursor paging. (#1188)
+
 ## v0.27.0 (summary quality)
 
 - Fix: the default summary-prefix sweep target is one leaf budget, capped at a quarter of the compaction threshold, so small windows no longer fill their threshold with summaries. Explicit targets are unchanged. In the deterministic 32K-window replay, compactions fall from 360 in rc3 to 78 (rc2: 116). (rc4)
