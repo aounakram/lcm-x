@@ -4942,7 +4942,7 @@ def _chunk_pending_rows(
     only what it saw.
     """
     if incremental:
-        already = set()
+        already = _chunk_boundary_done_ids(conn, identity_hash)
         inflight = _chunk_inflight_ids(conn, identity_hash)
         rows = _chunk_frontier_rows(
             conn, identity_hash, policy=policy, record_progress=record_progress
@@ -4991,7 +4991,10 @@ def _chunk_cursor(
         "SELECT MIN(id), MAX(id) FROM (SELECT CAST(substr(embedded_id, 1, "
         "instr(embedded_id, ':') - 1) AS INTEGER) AS id FROM "
         "lcm_embedding_backfill_inflight WHERE identity_hash = ?1 "
-        "AND instr(embedded_id, ':') > 1) WHERE id > 0",
+        "AND instr(embedded_id, ':') > 1 "
+        "AND substr(embedded_id, 1, instr(embedded_id, ':') - 1) NOT GLOB '*[^0-9]*' "
+        "AND substr(embedded_id, instr(embedded_id, ':') + 1) != '' "
+        "AND substr(embedded_id, instr(embedded_id, ':') + 1) NOT GLOB '*[^0-9]*') WHERE id > 0",
     ):
         try:
             first, last = conn.execute(sql, (identity_hash,)).fetchone()
@@ -5001,6 +5004,20 @@ def _chunk_cursor(
             low = int(first) if low is None else min(low, int(first))
             high = int(last) if high is None else max(high, int(last))
     return None if low is None else (low, high)
+
+
+def _chunk_boundary_done_ids(conn: sqlite3.Connection, identity_hash: str | None) -> set[str]:
+    """Read embedded ids for only the two messages incremental discovery revisits."""
+    bounds = _chunk_cursor(conn, identity_hash)
+    if bounds is None:
+        return set()
+    try:
+        return {str(row[0]) for row in conn.execute(
+            "SELECT chunk_id FROM lcm_chunk_meta WHERE store_id IN (?, ?) AND identity_hash = ?",
+            (*bounds, identity_hash),
+        )}
+    except sqlite3.OperationalError:
+        return set()  # table not created yet
 
 
 _CHUNK_HISTORY_SCAN_MESSAGES = 2_000  # history rows one discovery reads; rows that never chunk are re-read
@@ -5094,7 +5111,7 @@ def _chunk_frontier_rows(
         return
     low, high = bounds
     yield from conn.execute(
-        f"SELECT store_id, role, content FROM messages WHERE store_id > ?{eligible} ORDER BY store_id", (high,)
+        f"SELECT store_id, role, content FROM messages WHERE store_id >= ?{eligible} ORDER BY store_id", (high,)
     )
     if policy != "full" and revision < CHUNK_POLICY_REVISION:
         yield from _chunk_gapfill_rows(
@@ -5102,8 +5119,9 @@ def _chunk_frontier_rows(
             record_progress=record_progress,
         )
     yield from conn.execute(
-        f"SELECT store_id, role, content FROM messages WHERE store_id < ?{eligible} ORDER BY store_id DESC LIMIT ?",
-        (low, history_limit),
+        f"SELECT store_id, role, content FROM messages WHERE store_id <= ? AND store_id != ?{eligible} "
+        "ORDER BY store_id DESC LIMIT ?",
+        (low, high, history_limit),
     )
 
 
@@ -5115,7 +5133,8 @@ def _chunk_backlog_estimate(conn: sqlite3.Connection, identity_hash: str | None,
     total = 0
     gapfill = normalize_content_policy(policy) != "full" and _chunk_policy_revision(conn, identity_hash) < CHUNK_POLICY_REVISION
     suffix = " (gap-fill)" if gapfill else ""
-    inflight = _chunk_inflight_ids(conn, identity_hash) if gapfill else set()
+    already = _chunk_boundary_done_ids(conn, identity_hash)
+    inflight = _chunk_inflight_ids(conn, identity_hash)
     rows = _chunk_frontier_rows(
         conn, identity_hash, history_limit=_STATUS_CHUNK_SCAN_MESSAGES + 1, policy=policy
     )
@@ -5124,7 +5143,7 @@ def _chunk_backlog_estimate(conn: sqlite3.Connection, identity_hash: str | None,
             return f"{total}+{suffix}"
         total += sum(
             1 for chunk in chunk_message(row[0], row[1], row[2], policy=policy)
-            if chunk.char_end > chunk.char_start and chunk.chunk_id not in inflight
+            if chunk.char_end > chunk.char_start and chunk.chunk_id not in inflight and chunk.chunk_id not in already
         )
     return f"{total}{suffix}"
 

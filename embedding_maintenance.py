@@ -205,7 +205,7 @@ def _run_pass(db_path: str | Path, config: Any, breaker: Any) -> tuple[str, str 
         result = command._embedding_register_profiles(config, db_path, allow_download=False)
         if isinstance(result, str):
             return "auto_register_unavailable", result
-        del result  # release the probe models before the backfill loads its own
+        del result  # provider instances are disposable; FastEmbed shares its model
     if breaker is not None and breaker.is_open():
         return "circuit_open", None  # the query path's breaker is cooling down
     probe = probe_provider_availability(config)
@@ -215,12 +215,12 @@ def _run_pass(db_path: str | Path, config: Any, breaker: Any) -> tuple[str, str 
     limit = command._embedding_backfill_batch_size(
         getattr(config, "embedding_max_batch_items", None)
     )
-    corpora = [("summaries", lambda: command._embedding_backfill_summary_run(
-        config, db_path, apply=True, limit=limit, retry_uncertain=False,
+    corpora = [("summaries", lambda retry: command._embedding_backfill_summary_run(
+        config, db_path, apply=True, limit=limit, retry_uncertain=retry,
     ))]
     if _automatic_chunks_allowed(config, command):
-        corpora.append(("chunks", lambda: command._chunk_backfill_run(
-            config, db_path, apply=True, limit=limit, retry_uncertain=False, policy="",
+        corpora.append(("chunks", lambda retry: command._chunk_backfill_run(
+            config, db_path, apply=True, limit=limit, retry_uncertain=retry, policy="",
             incremental=True,
         )))
     outcomes: list[str] = []
@@ -232,15 +232,21 @@ def _run_pass(db_path: str | Path, config: Any, breaker: Any) -> tuple[str, str 
             outcomes.append(f"{name}=deferred")
             continue
         embedded = 0
-        while True:
-            result = run()
-            if isinstance(result, str) or _corpus_failure(result) is not None:
+        for retry in (False, True) if local else (False,):
+            if retry and time.monotonic() >= deadline:
                 break
-            embedded += result["embedded"]
-            # Drain batch by batch; no batch starts after the budget, and whatever is
-            # left resumes on the next trigger.
-            if (not result["embedded"] or not result["remaining"] or result["stop_reason"]
-                    or time.monotonic() >= deadline):
+            while True:
+                result = run(retry)
+                if isinstance(result, str) or _corpus_failure(result) is not None:
+                    break
+                embedded += result["embedded"]
+                # Drain ordinary batches, then retry local uncertainty once.
+                # Both stages share the trigger's deadline. Hosted/Ollama
+                # uncertainty keeps its explicit operator authorization gate.
+                if (retry or not result["embedded"] or not result["remaining"] or result["stop_reason"]
+                        or time.monotonic() >= deadline):
+                    break
+            if isinstance(result, str) or result["status"] == "error":
                 break
         if isinstance(result, str):
             if getattr(result, "reason", "") == "lease_held":

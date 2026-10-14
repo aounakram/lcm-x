@@ -211,6 +211,140 @@ def _local_engine(tmp_path, home, provider="fastembed"):
     return engine
 
 
+def test_1110_one_model_across_two_multibatch_passes(tmp_path, home, local_fastembed):
+    engine = _local_engine(tmp_path, home)
+    engine._config.embedding_max_batch_items = 2
+    try:
+        for turn in range(2):
+            for index in range(4):
+                engine._store.append(SESSION, {"role": "user", "content": f"{turn}/{index} {FILLER}"})
+            maintenance_mod.run_incremental_embedding_pass(engine._config.database_path, engine._config)
+        assert _chunk_vector_count(engine) == 8
+        assert len(local_fastembed[0]) == 1
+    finally:
+        engine.shutdown()
+
+
+def test_1110_retries_only_fastembed_uncertain_rows(tmp_path, home, providers, monkeypatch):
+    monkeypatch.setattr(provider_mod, "probe_provider_availability",
+                        lambda _config: {"available": True, "detail": "offline fake"})
+    results = {}
+    for provider in ("voyage", "ollama", "fastembed"):
+        path = tmp_path / provider
+        path.mkdir()
+        engine = _make_engine(path, home, provider=provider)
+        try:
+            engine._store.append(SESSION, {"role": "user", "content": FILLER})
+            leaf = str(engine._dag.add_node(SummaryNode(
+                session_id=SESSION, depth=0, summary="uncertain summary",
+                created_at=1.0, latest_at=1.0,
+            )))
+            store = VectorStore(engine._config.database_path, config=engine._config)
+            try:
+                store.ensure_chunk_schema()
+                conn = store.connection
+                command_mod._ensure_inflight_table(conn)
+                for task, identity in conn.execute(
+                    "SELECT task, identity_hash FROM lcm_embedding_profile WHERE active = 1"
+                ).fetchall():
+                    embedded_id = "1:0" if task == "chunk" else leaf
+                    conn.execute(
+                        "INSERT INTO lcm_embedding_backfill_inflight "
+                        "(embedded_id, identity_hash, state, updated_at) VALUES (?, ?, 'uncertain', 1)",
+                        (embedded_id, identity),
+                    )
+                conn.commit()
+            finally:
+                store.close()
+            maintenance_mod.run_incremental_embedding_pass(engine._config.database_path, engine._config)
+            results[provider] = (_chunk_vector_count(engine), _summary_vector_ids(engine), _inflight_count(engine))
+        finally:
+            engine.shutdown()
+    assert results["voyage"] == results["ollama"] == (0, [], 2)
+    assert results["fastembed"] == (1, [leaf], 0)
+
+
+@pytest.mark.parametrize("malformed", ["999999:bad", "12x:0", "999999:", "999999:0:1"])
+def test_1110_cursor_requires_two_digit_parts(tmp_path, home, providers, malformed):
+    engine = _make_engine(tmp_path, home)
+    try:
+        store = VectorStore(engine._config.database_path, config=engine._config)
+        try:
+            store.ensure_chunk_schema()
+            conn = store.connection
+            command_mod._ensure_inflight_table(conn)
+            identity = command_mod._chunk_current_profile(conn)["identity_hash"]
+            conn.execute("INSERT INTO lcm_embedding_backfill_inflight (embedded_id, identity_hash) VALUES (?, ?)",
+                         (malformed, identity))
+            assert command_mod._chunk_cursor(conn, identity) is None
+        finally:
+            store.close()
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("leg", ["new", "history"])
+def test_1103_finishes_split_boundary_message(tmp_path, home, providers, monkeypatch, leg):
+    engine = _make_engine(tmp_path, home)
+    engine._config.embedding_max_batch_items = 2
+    long_text = ". ".join(f"Sentence{index} {FILLER}" for index in range(12)) + "."
+    try:
+        if leg == "history":
+            engine._store.append(SESSION, {"role": "user", "content": long_text})
+        engine._store.append(SESSION, {"role": "user", "content": FILLER})
+        seed = _rows(engine, "SELECT MAX(store_id) FROM messages")[0][0]
+        if leg == "new":
+            engine._store.append(SESSION, {"role": "user", "content": long_text})
+        long_id = seed + 1 if leg == "new" else seed - 1
+        store = VectorStore(engine._config.database_path, config=engine._config)
+        try:
+            identity = store._identity_from_profile(command_mod._chunk_current_profile(store.connection))
+            chunk = command_mod.chunk_message(seed, "user", FILLER)[0]
+            store.record_chunk_embedding(chunk.chunk_id, "model-a", [1.0, 0.0],
+                                         store_id=seed, chunk_index=chunk.chunk_index,
+                                         char_start=chunk.char_start, char_end=chunk.char_end,
+                                         token_estimate=chunk.token_estimate, identity=identity)
+            command_mod._record_chunk_policy_revision(store.connection, identity.identity_hash)
+            store.connection.commit()
+        finally:
+            store.close()
+        chunks = command_mod.chunk_message(long_id, "user", long_text)
+        assert len(chunks) >= 3
+        calls = [0]
+        real_embed = FakeProvider.embed_document_batches
+
+        def fail_second(self, texts, *, before_dispatch):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise ProviderUnavailable("second batch unavailable before dispatch")
+            yield from real_embed(self, texts, before_dispatch=before_dispatch)
+
+        monkeypatch.setattr(FakeProvider, "embed_document_batches", fail_second)
+        first = command_mod._chunk_backfill_run(engine._config, engine._config.database_path,
+            apply=True, limit=2, retry_uncertain=False, policy="", incremental=True)
+        assert first["embedded"] == 2
+        conn = sqlite3.connect(engine._config.database_path)
+        try:
+            backlog = command_mod._chunk_backlog_estimate(conn, identity.identity_hash, "conversational")
+            assert backlog == str(len(chunks) - 2)
+        finally:
+            conn.close()
+        monkeypatch.setattr(FakeProvider, "embed_document_batches", real_embed)
+        second = command_mod._chunk_backfill_run(engine._config, engine._config.database_path,
+            apply=True, limit=2, retry_uncertain=False, policy="", incremental=True)
+        assert second["embedded"] == len(chunks) - 2
+        assert {row[0] for row in _rows(engine, "SELECT chunk_id FROM lcm_chunk_meta")} == {
+            f"{seed}:0", *(chunk.chunk_id for chunk in chunks),
+        }
+        conn = sqlite3.connect(engine._config.database_path)
+        try:
+            assert command_mod._chunk_backlog_estimate(conn, identity.identity_hash, "conversational") == "0"
+        finally:
+            conn.close()
+    finally:
+        engine.shutdown()
+
+
 def _profiles(engine):
     try:
         return _rows(engine, "SELECT task, active, identity_hash FROM lcm_embedding_profile")
@@ -908,7 +1042,7 @@ def test_automatic_chunk_discovery_is_bounded_by_new_messages_not_the_store(
         calls.clear()
         maintenance_mod.run_incremental_embedding_pass(db_path, engine._config)
         assert _chunk_vector_count(engine) == batch
-        assert len(calls) <= batch + 2
+        assert len(calls) <= batch + 3  # remaining check: two boundaries and next history row
         newest = [row[0] for row in _rows(engine, "SELECT store_id FROM messages ORDER BY store_id DESC")]
         assert {row[0] for row in _rows(engine, "SELECT store_id FROM lcm_chunk_meta")} == set(newest[:batch])
 
@@ -921,7 +1055,7 @@ def test_automatic_chunk_discovery_is_bounded_by_new_messages_not_the_store(
         calls.clear()
         maintenance_mod.run_incremental_embedding_pass(db_path, engine._config)
         assert _chunk_vector_count(engine) == 603
-        assert len(calls) <= 5
+        assert len(calls) <= 7  # three new rows, plus two boundaries in discovery and remaining
     finally:
         engine.shutdown()
 
@@ -994,7 +1128,7 @@ def test_1063_g_registration_provider_released_before_backfill(
             engine._config.database_path, engine._config,
         )
         print(f"G: registration provider alive at backfill={alive_at_backfill}")
-        assert refs and alive_at_backfill == [[False]]
+        assert refs and alive_at_backfill == [[False], [False]]  # normal pass + local retry
     finally:
         engine._close_storage()
 

@@ -75,6 +75,8 @@ _MAX_ATTEMPTS = 3
 _RETRY_AFTER_BUDGET_S = 60.0
 _DEFAULT_FASTEMBED_CACHE = Path.home() / ".cache" / "fastembed"
 _FASTEMBED_THREADS = 2
+_FASTEMBED_MODEL_LOCK = threading.RLock()
+_FASTEMBED_MODELS: dict[tuple[str, str, int], Any] = {}
 _LOCAL_EMBED_MAX_WORKERS = 4
 _LOCAL_EMBED_WORKER_SLOTS = threading.BoundedSemaphore(_LOCAL_EMBED_MAX_WORKERS)
 
@@ -1808,6 +1810,16 @@ class FastembedProvider(_ResilientProvider):
         return self._dim
 
     def _construct(self, *, allow_download: bool) -> Any:
+        with _FASTEMBED_MODEL_LOCK:
+            key = self._cache_key()
+            if key not in _FASTEMBED_MODELS:
+                _FASTEMBED_MODELS[key] = self._construct_uncached(allow_download=allow_download)
+            return _FASTEMBED_MODELS[key]
+
+    def _cache_key(self) -> tuple[str, str, int]:
+        return self.model_id, str(self.cache_dir.resolve()), _FASTEMBED_THREADS
+
+    def _construct_uncached(self, *, allow_download: bool) -> Any:
         try:
             text_embedding = _load_fastembed()
         except ImportError as exc:
@@ -1831,9 +1843,15 @@ class FastembedProvider(_ResilientProvider):
                 "run /lcm embed warmup"
             ) from exc
 
-    def _ensure_local(self) -> Any:
+    def _ensure_local(self, *, allow_download: bool = False) -> Any:
         if self._model is None:
-            self._model = self._construct(allow_download=False)
+            # Construction/publication is serialized; encoding never holds this
+            # lock, so a query that outlives its deadline cannot block backfill.
+            with _FASTEMBED_MODEL_LOCK:
+                key = self._cache_key()
+                if key not in _FASTEMBED_MODELS:
+                    _FASTEMBED_MODELS[key] = self._construct(allow_download=allow_download)
+                self._model = _FASTEMBED_MODELS[key]
         return self._model
 
     def _embed(
@@ -1901,9 +1919,9 @@ class FastembedProvider(_ResilientProvider):
         """The only path allowed to download a missing FastEmbed model."""
         if self._model is None:
             try:
-                self._model = self._construct(allow_download=False)
+                self._ensure_local()
             except ProviderNotWarmedUp:
-                self._model = self._construct(allow_download=True)
+                self._ensure_local(allow_download=True)
         return self.embed_query("warmup")
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
