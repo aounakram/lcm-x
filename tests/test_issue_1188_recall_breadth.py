@@ -253,7 +253,7 @@ def test_REGRESSION_shared_guidance(engine):
     assert host['lcm_recall'] == v2['lcm_recall']
     assert host['lcm_load_session'] == v2['lcm_load_session']
     assert host['lcm_recall']['description'] == schemas.LCM_RECALL['description'] + ' ' + GUIDANCE
-    assert 'Use this after lcm_recall, session_search or lcm_grep has identified a session_id; pass anchor_store_id to read the conversation around one hit.' in host['lcm_load_session']['description']
+    assert 'Use this after lcm_recall, session_search or lcm_grep has identified a session_id that already exists in lcm.db; pass anchor_store_id to read the conversation around one hit.' in host['lcm_load_session']['description']
 
 
 def test_REGRESSION_guidance_v1_identity():

@@ -1048,7 +1048,8 @@ def lcm_evidence_pack(args: Dict[str, Any], **kwargs) -> str:
     return build_evidence_pack(
         args,
         engine=engine,
-        retrieve=lambda recall_args: lcm_recall(recall_args, engine=engine),
+        retrieve=lambda recall_args: lcm_recall(
+            recall_args, engine=engine, min_sessions=0, session_hints=False, recall_guidance="v1"),
     )
 
 
@@ -1069,7 +1070,8 @@ def lcm_compile_evidence(args: Dict[str, Any], **kwargs) -> str:
             engine=engine,
             baseline_refs=args.get("baseline_refs") or (),
             question_as_of=args.get("question_date"),
-            retrieve=lambda recall_args: lcm_recall(recall_args, engine=engine),
+            retrieve=lambda recall_args: lcm_recall(
+                recall_args, engine=engine, min_sessions=0, session_hints=False, recall_guidance="v1"),
             enabled=True,
             budgets=args.get("budgets"),
         )
@@ -1082,7 +1084,8 @@ def lcm_compile_evidence(args: Dict[str, Any], **kwargs) -> str:
         baseline_refs=args.get("baseline_refs") or (),
         question_date=args.get("question_date"),
         selector=lambda _request: proposal,
-        retrieve=lambda recall_args: lcm_recall(recall_args, engine=engine),
+        retrieve=lambda recall_args: lcm_recall(
+            recall_args, engine=engine, min_sessions=0, session_hints=False, recall_guidance="v1"),
         enabled=True,
         persist_view=args.get("persist_view") is True,
         budgets=args.get("budgets"),
@@ -5898,6 +5901,7 @@ def _lcm_recall_fts_anchor(
 
 def _lcm_recall_session_floor(
     ordered: list[dict[str, Any]], limit: int, requested: int,
+    *, protected_entry: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Promote unseen sessions in fused order; retain every entry and score.
 
@@ -5917,12 +5921,14 @@ def _lcm_recall_session_floor(
         if not sid or sid in represented:
             continue
         seen = set()
-        cut = 0
+        cut = None
         for i, entry in enumerate(result[:limit]):
             session = entry["hit"].get("session_id")
-            if not session or session in seen:
+            if entry is not protected_entry and (not session or session in seen):
                 cut = i
             seen.add(session)
+        if cut is None:
+            break
         index = next(i for i, entry in enumerate(result) if entry is candidate)
         result.pop(index)
         displaced = result.pop(cut)
@@ -5935,12 +5941,13 @@ def _lcm_recall_session_floor(
 
 
 def _lcm_recall_session_hint(engine: "LCMEngine", hit: dict[str, Any]) -> str | None:
-    session = hit.get("session_id")
     store_id = hit.get("store_id")
     if hit.get("node_id") is not None and (hit.get("kind") == "summary" or store_id is None):
         sources = engine._dag.source_message_ids(hit["node_id"], limit=1)
         store_id = sources[0] if sources else None
-    if not session or store_id is None:
+    row = engine._store.get(store_id) if store_id is not None else None
+    session = row.get("session_id") if row else None
+    if not session:
         return None
     return f"lcm_load_session(session_id={session!r}, anchor_store_id={store_id})"
 
@@ -6190,9 +6197,10 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     requested_limit = parsed_limit
     limit = min(requested_limit, _LCM_RECALL_LIMIT_CAP)
 
-    min_sessions = max(0, min(10, _parse_int_value(
-        kwargs.get("min_sessions", args.get("min_sessions", getattr(engine._config, "recall_min_sessions", 0))), 0
-    )))
+    min_sessions_arg = kwargs.get("min_sessions", args.get("min_sessions"))
+    if min_sessions_arg is None:
+        min_sessions_arg = getattr(engine._config, "recall_min_sessions", 0)
+    min_sessions = max(0, min(10, _parse_int_value(min_sessions_arg, 0)))
     session_hints = bool(kwargs.get("session_hints", getattr(engine._config, "recall_session_hints", False)))
     guidance_v2 = kwargs.get("recall_guidance", getattr(engine._config, "recall_guidance", "v1")) == "v2"
 
@@ -6686,7 +6694,11 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
 
     session_floor_info = None
     if min_sessions:
-        ordered, session_floor_info = _lcm_recall_session_floor(ordered, limit, min_sessions)
+        protected_entry = None
+        if fts_anchor_info and fts_anchor_info["fired"]:
+            protected_entry = ordered[fts_anchor_info["position"] - 1]
+        ordered, session_floor_info = _lcm_recall_session_floor(
+            ordered, limit, min_sessions, protected_entry=protected_entry)
 
     # -- Response shaping (char-capped). The default snippets path retains the
     # historical order and serialized response exactly. answer_ready applies
@@ -7046,6 +7058,9 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
             if reference_strict:
                 more = bool(strict_selector.take(strict_selector.ledger.live_count + 1))
                 more = more or bool(strict_selector.diversity_dropped)
+                # Post-budget rejections can be hydrated on a later call; they
+                # are remaining evidence, unlike unusable in-budget rows.
+                more = more or any(value is False for value in strict_selector._rejected.values())
             else:
                 more = selection_has_more
             expansion.update(

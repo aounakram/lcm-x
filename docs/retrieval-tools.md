@@ -230,13 +230,18 @@ off. There are three configuration keys: continuation shares the guidance key.
 | Multi-session guidance | `LCM_RECALL_GUIDANCE=v1` | `v2` adds combine/compare and stopping guidance to tool descriptions. |
 | Continuation | `LCM_RECALL_GUIDANCE=v1` | With `v2`, `provenance.answer_ready` adds `sessions_delivered`, `sessions_in_pool` and `more_available`. These describe this candidate pool, not exhaustive corpus coverage. |
 
-`provenance.session_floor` reports requested and achieved ranked-window breadth,
-the number of promoted entries, and the distinct sessions finally delivered.
+`provenance.session_floor` reports requested breadth, promoted entries, and the
+distinct sessions finally delivered. `session_floor.achieved` = distinct sessions
+in the delivered window and may exceed `requested`.
 Verification and response caps may reduce delivery below the floor; a window
 cannot represent more sessions than its `limit`. Proactive recall and the
-pre-answer baseline explicitly retain their previous behavior with these keys on.
+pre-answer baseline, evidence-pack, compile-evidence and requirements retrieval
+explicitly retain their previous behavior with these keys on.
 
-The additive anchor mode is always available:
+The v1 tool schemas remain byte-identical to v0.27.0-rc5. With
+`LCM_RECALL_GUIDANCE=v2`, schemas additionally expose `min_sessions` on
+`lcm_recall` and `anchor_store_id`/`before`/`after` on `lcm_load_session`.
+Handlers accept these arguments in both modes. The anchor mode is:
 
 ```text
 lcm_load_session(session_id='earlier', anchor_store_id=123, before=6, after=12)
