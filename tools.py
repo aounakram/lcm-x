@@ -5689,6 +5689,16 @@ def _lcm_recall_rerank(
     if not bool(getattr(config, "rerank_enabled", False)):
         return ordered, "disabled", []
     provider_id, model = rerank_selection(config)
+    voyage_provider = getattr(provider, "provider_id", "") == "voyage" and hasattr(provider, "rerank")
+    if (
+        provider_id == "voyage"
+        and not voyage_provider
+        and bool(getattr(config, "embeddings_enabled", False))
+        and str(getattr(config, "embedding_provider", "") or "").strip().lower() in {"voyage", "voyageai"}
+    ):
+        # Voyage embeddings degraded for this recall (query-embedding failure,
+        # timeout, scope timeout, proactive override): keep the base skip.
+        return ordered, "skipped: rerank requires the voyage provider", []
     if provider_id == "unknown":
         warn_rerank_once("unknown rerank model")
         return ordered, "skipped: unknown rerank model", []
@@ -5698,7 +5708,7 @@ def _lcm_recall_rerank(
     def resolve_reranker():
         if provider_id == "fastembed":
             return local_reranker(model)
-        if getattr(provider, "provider_id", "") == "voyage" and hasattr(provider, "rerank"):
+        if voyage_provider:
             return provider
         cached = getattr(engine, "_lcm_rerank_provider_cache", None)
         if cached is not None:
@@ -5711,7 +5721,7 @@ def _lcm_recall_rerank(
         return resolved
 
     try:
-        provider = _run_within_deadline(resolve_reranker, remaining_s=deadline - time.monotonic(), name="lcm-rerank-provider")
+        provider = _run_within_deadline(resolve_reranker, remaining_s=deadline - time.monotonic(), name="lcm-recall-rerank")
     except Exception as exc:
         return ordered, f"skipped: {exc}", []
     outbound_query = str(query)
@@ -5754,8 +5764,6 @@ def _lcm_recall_rerank(
     except EmbeddingPrivacyPolicyError:
         raise
     except Exception as exc:  # noqa: BLE001 - any failure => skip rerank
-        if str(exc) == "rerank model not prepared":
-            warn_rerank_once(str(exc))
         return ordered, f"skipped: {exc}", []
     if not ranked:
         return ordered, "skipped: empty rerank result", []

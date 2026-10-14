@@ -28,6 +28,13 @@ def entries(n=3):
             for i in range(n)]
 
 
+def wait_for(predicate, timeout=2.0):
+    end = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < end, "condition not reached"
+        time.sleep(0.01)
+
+
 def run_rerank(config, ordered=None, provider=None, **kwargs):
     return tools._lcm_recall_rerank(
         provider, "kanban", entries() if ordered is None else ordered,
@@ -38,13 +45,18 @@ def run_rerank(config, ordered=None, provider=None, **kwargs):
 
 @pytest.fixture
 def local(monkeypatch, tmp_path):
-    state = SimpleNamespace(calls=[], payloads=[], logits=[-1.0, 1.0], absent=False, delay=0.0)
+    state = SimpleNamespace(calls=[], payloads=[], logits=[-1.0, 1.0], absent=False, delay=0.0,
+                            download_delay=0.0, download_error=None)
 
     class Encoder:
         def __init__(self, **kwargs):
             state.calls.append(kwargs)
             if state.absent and kwargs["local_files_only"]:
                 raise FileNotFoundError("synthetic empty cache")
+            if not kwargs["local_files_only"]:
+                time.sleep(state.download_delay)
+                if state.download_error is not None:
+                    raise state.download_error
 
         def rerank(self, query, documents):
             state.payloads.append((query, list(documents)))
@@ -233,7 +245,8 @@ def test_r7_unknown_warns_once(local, caplog):
     incoming = entries()
     for _ in range(2):
         assert run_rerank(config, incoming) == (incoming, "skipped: unknown rerank model", [])
-    assert len([r for r in caplog.records if "unknown rerank model" in r.message]) == 1
+    warnings = [r.message for r in caplog.records if "unknown rerank model" in r.message]
+    assert len(warnings) == 1 and "warmup" not in warnings[0]  # Warmup cannot fix an unknown prefix.
     assert local.calls == []
 
 
@@ -320,3 +333,119 @@ def test_r10_cached_model_latency():
     p50 = statistics.median(elapsed)
     p90 = sorted(elapsed)[math.ceil(len(elapsed) * 0.9) - 1]
     path.write_text(f"model | snippets | runs | p50 ms | p90 ms\n{LOCAL_MODEL} | 50 x 300 chars | 20 | {p50:.2f} | {p90:.2f}\n")
+
+
+@pytest.mark.parametrize("model", ["rerank-2.5-lite", "voyage:rerank-2.5-lite"])
+@pytest.mark.parametrize("degraded", [None, SimpleNamespace(provider_id="fastembed")],
+                         ids=["embedding-failed-or-timed-out", "proactive-fastembed-override"])
+def test_r1_degraded_voyage_embedding_keeps_base_skip(monkeypatch, model, degraded):
+    config = LCMConfig(rerank_enabled=True, rerank_model=model, embeddings_enabled=True,
+                       embedding_provider="voyage", embedding_model="voyage-4-lite",
+                       embedding_privacy_enabled=False)
+    monkeypatch.setattr(tools, "resolve_provider", lambda _: pytest.fail("no rerank-only Voyage provider"))
+    engine = SimpleNamespace(_config=config)
+    incoming = entries()
+    assert run_rerank(config, incoming, degraded, engine=engine) == (
+        incoming, "skipped: rerank requires the voyage provider", [])
+    assert not hasattr(engine, "_lcm_rerank_provider_cache")
+
+
+def test_r3_slow_inference_blocks_no_state_reader(local, engine):
+    local.delay = 2.0
+    config = engine._config
+    first = threading.Thread(target=run_rerank, args=(config,), kwargs={"deadline": time.monotonic() + 5})
+    first.start()
+    observed = []
+
+    def readers():
+        ep.local_reranker(LOCAL_MODEL)
+        ep.warn_rerank_once("synthetic reason")
+        observed.append(ep.rerank_readiness(config))
+        observed.append(tools._embedding_provider_health_check(engine)["rerank"])
+        observed.append(run_rerank(config, deadline=time.monotonic() + 0.3)[1])
+
+    reader = threading.Thread(target=readers)
+    try:
+        wait_for(lambda: local.payloads)
+        reader.start()
+        reader.join(1.5)
+        assert not reader.is_alive() and first.is_alive()
+        assert observed[:2] == [f"fastembed:{LOCAL_MODEL} ready"] * 2
+        # The second recall resolved its reranker; only its inference waited on the first.
+        assert "lcm-recall-rerank exceeded" in observed[2] or observed[2] == "skipped: rerank deadline exceeded"
+    finally:
+        first.join()
+        if reader.ident is not None:
+            reader.join()
+
+
+def test_r3_warmup_download_blocks_neither_recall_nor_doctor(local, engine):
+    local.absent, local.download_delay = True, 2.0
+    warm = threading.Thread(target=command.handle_lcm_command, args=("embed warmup", engine))
+    warm.start()
+    observed = []
+
+    def readers():
+        observed.append(ep.rerank_readiness(engine._config))
+        observed.append(tools._embedding_provider_health_check(engine)["rerank"])
+        observed.append(run_rerank(engine._config)[1])
+
+    reader = threading.Thread(target=readers)
+    try:
+        wait_for(lambda: any(not call["local_files_only"] for call in local.calls))
+        reader.start()
+        reader.join(1.5)
+        assert not reader.is_alive() and warm.is_alive()
+        assert observed == ["not prepared", "not prepared", "skipped: rerank model not prepared"]
+    finally:
+        warm.join()
+        if reader.ident is not None:
+            reader.join()
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (f"fastembed:  {LOCAL_MODEL} ", ("fastembed", LOCAL_MODEL)),
+    (" voyage: rerank-2.5 ", ("voyage", "rerank-2.5")),
+])
+def test_r6_whitespace_after_prefix(value, expected):
+    assert ep.rerank_selection(SimpleNamespace(rerank_model=value)) == expected
+
+
+@pytest.mark.parametrize(("failure", "cause"), [
+    ("unknown", "is not supported in TextCrossEncoder"),
+    ("fastembed-missing", "FastEmbed is not installed"),
+    ("network", "synthetic network unreachable"),
+])
+def test_r7_failed_rerank_warmup_still_warms_embeddings(local, engine, monkeypatch, failure, cause):
+    warmed = []
+    monkeypatch.setattr(command, "_embedding_register_profiles",
+                        lambda *a, **k: warmed.append(k) or "LCM embedding warmup\nstatus: ok")
+    if failure == "fastembed-missing":
+        monkeypatch.setitem(sys.modules, "fastembed.rerank.cross_encoder", None)
+    elif failure == "unknown":
+        local.download_error = ValueError(f"Model {LOCAL_MODEL} is not supported in TextCrossEncoder.")
+    else:
+        local.download_error = ConnectionError("synthetic network unreachable")
+    text = command.handle_lcm_command("embed warmup", engine)
+    assert warmed == [{"allow_download": True}]
+    assert text.startswith("LCM embedding warmup\nstatus: ok\n")
+    line = text.splitlines()[-1]
+    assert line.startswith("rerank: error:") and cause in line and "not prepared" not in line
+
+
+def test_r7_cached_files_report_cached_without_loading(local, engine):
+    onnx = (Path(os.environ["FASTEMBED_CACHE_PATH"]) / "models--Xenova--ms-marco-MiniLM-L-6-v2"
+            / "snapshots" / "synthetic-revision" / "onnx" / "model.onnx")
+    onnx.parent.mkdir(parents=True)
+    onnx.write_bytes(b"synthetic")
+    assert tools._embedding_provider_health_check(engine)["rerank"] == f"fastembed:{LOCAL_MODEL} cached"
+    assert f"rerank: fastembed:{LOCAL_MODEL} cached" in command.handle_lcm_command("doctor", engine).splitlines()
+    assert local.calls == []
+
+
+def test_slot_exhaustion_names_rerank_stage(local, monkeypatch):
+    slots = threading.BoundedSemaphore(1)
+    slots.acquire()
+    monkeypatch.setattr(tools, "_lcm_semantic_worker_slots", slots)
+    config = LCMConfig(rerank_enabled=True, rerank_model=f"fastembed:{LOCAL_MODEL}")
+    assert run_rerank(config)[1] == "skipped: lcm-recall-rerank worker capacity is exhausted"

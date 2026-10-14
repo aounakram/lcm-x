@@ -3170,17 +3170,21 @@ def _embedding_register_profiles(config, db_path, *, allow_download: bool) -> st
 def _embedding_warmup_text(engine) -> str:
     """Warm and dimension-lock both summary and chunk vector profiles."""
     try:
-        rerank_provider, rerank_model = rerank_selection(engine._config)
-        local_rerank = engine._config.rerank_enabled and rerank_provider == "fastembed"
-        if local_rerank:
-            local_reranker(rerank_model).warmup()
         result = _embedding_register_profiles(engine._config, engine._store.db_path, allow_download=True)
         if isinstance(result, dict):
             engine._lcm_embedding_provider_cache = result["provider_cache"]
         text = result["text"] if isinstance(result, dict) else result
-        return text + f"\nrerank: {rerank_readiness(engine._config)}" if local_rerank else text
     except Exception as exc:
-        return "\n".join(["LCM embedding warmup", "status: error", f"error: {exc}"])
+        text = "\n".join(["LCM embedding warmup", "status: error", f"error: {exc}"])
+    rerank_provider, rerank_model = rerank_selection(engine._config)
+    if not (engine._config.rerank_enabled and rerank_provider == "fastembed"):
+        return text
+    # Local rerank prepares after, and independently of, the embedding warmup.
+    try:
+        local_reranker(rerank_model).warmup()
+        return text + f"\nrerank: {rerank_readiness(engine._config)}"
+    except Exception as exc:
+        return text + f"\nrerank: error: {exc}"
 
 
 def _embedding_read_connection(db_path: str | Path) -> sqlite3.Connection:

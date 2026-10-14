@@ -1938,7 +1938,9 @@ class FastembedProvider(_ResilientProvider):
         return self._embed((str(text),), query=True)[0]
 
 
-_RERANK_LOCK = threading.RLock()
+# Selection, readiness and warning state only: never held across a model load,
+# a download or an inference. Inference serialises on each reranker's own lock.
+_RERANK_LOCK = threading.Lock()
 _LOCAL_RERANKER: Any = None
 _RERANK_WARNED: set[str] = set()
 
@@ -1948,39 +1950,64 @@ def rerank_selection(config: Any) -> tuple[str, str]:
     if value.startswith("rerank-"):
         return "voyage", value
     provider, _, model = value.partition(":")
+    provider, model = provider.strip(), model.strip()
     return (provider, model) if provider in {"voyage", "fastembed"} and model else ("unknown", value)
 
 
-def warn_rerank_once(reason: str) -> None:
+def warn_rerank_once(reason: str, *, warmup_fixes: bool = False) -> None:
     with _RERANK_LOCK:
-        if reason not in _RERANK_WARNED:
-            _RERANK_WARNED.add(reason)
-            logger.warning("%s; for local rerank run /lcm embed warmup", reason)
+        if reason in _RERANK_WARNED:
+            return
+        _RERANK_WARNED.add(reason)
+    logger.warning("%s; run /lcm embed warmup" if warmup_fixes else "%s", reason)
 
 
 class FastembedReranker(FastembedProvider):
     """Cached-only cross-encoder in recall; downloads belong to explicit warmup."""
 
+    def __init__(self, model: str, **kwargs: Any) -> None:
+        super().__init__(model, **kwargs)
+        self._infer_lock = threading.Lock()
+
     def _construct(self, *, allow_download: bool) -> Any:
         try:
             from fastembed.rerank.cross_encoder import TextCrossEncoder
-
+        except ImportError as exc:
+            reason = "FastEmbed is not installed; install the optional fastembed dependency"
+            if not allow_download:
+                warn_rerank_once(reason)
+            raise ProviderUnavailable(reason) from exc
+        try:
             return TextCrossEncoder(
                 model_name=self.model_id, cache_dir=str(self.cache_dir),
                 threads=_FASTEMBED_THREADS, local_files_only=not allow_download,
             )
         except Exception as exc:
+            if allow_download:
+                raise EmbeddingProviderError(f"FastEmbed rerank warmup failed for {self.model_id}: {exc}") from exc
+            warn_rerank_once("rerank model not prepared", warmup_fixes=True)
             raise ProviderNotWarmedUp("rerank model not prepared") from exc
 
-    def warmup(self) -> Any:
+    def _publish(self, model: Any) -> Any:
         with _RERANK_LOCK:
             if self._model is None:
-                self._model = self._construct(allow_download=True)
+                self._model = model
             return self._model
+
+    def _ensure_local(self) -> Any:
+        return self._model if self._model is not None else self._publish(self._construct(allow_download=False))
+
+    def warmup(self) -> Any:
+        # The download runs outside every lock so recall and doctor never wait on it.
+        return self._model if self._model is not None else self._publish(self._construct(allow_download=True))
+
+    def files_cached(self) -> bool:
+        snapshots = self.cache_dir / f"models--{self.model_id.replace('/', '--')}" / "snapshots"
+        return snapshots.is_dir() and any(snapshots.rglob("*.onnx"))
 
     def rerank(self, query, documents, *, top_k=None, timeout, model=None):
         deadline = time.monotonic() + timeout
-        if not _RERANK_LOCK.acquire(timeout=max(0.0, timeout)):
+        if not self._infer_lock.acquire(timeout=max(0.0, timeout)):
             raise TimeoutError("rerank deadline exceeded")
         try:
             encoder = self._ensure_local()
@@ -1991,7 +2018,7 @@ class FastembedReranker(FastembedProvider):
                       for i, v in enumerate(map(float, logits))]
             return sorted(scores, key=lambda item: (-item[1], item[0]))[:top_k]
         finally:
-            _RERANK_LOCK.release()
+            self._infer_lock.release()
 
 
 def local_reranker(model: str) -> FastembedReranker:
@@ -2009,9 +2036,12 @@ def rerank_readiness(config: Any) -> str:
     provider, model = rerank_selection(config)
     if provider == "unknown":
         return "unknown"
-    ready = (local_reranker(model)._model is not None if provider == "fastembed"
-             else bool(os.environ.get("VOYAGE_API_KEY", "").strip()))
-    return f"{provider}:{model} ready" if ready else "not prepared"
+    if provider == "fastembed":
+        reranker = local_reranker(model)
+        if reranker._model is not None:
+            return f"{provider}:{model} ready"
+        return f"{provider}:{model} cached" if reranker.files_cached() else "not prepared"
+    return f"{provider}:{model} ready" if os.environ.get("VOYAGE_API_KEY", "").strip() else "not prepared"
 
 
 def resolve_provider(
