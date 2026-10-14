@@ -882,6 +882,7 @@ def test_automatic_chunk_discovery_is_bounded_by_new_messages_not_the_store(
         "chunk_message",
         lambda *args, **kwargs: calls.append(args[0]) or real_chunk_message(*args, **kwargs),
     )
+    monkeypatch.setattr(maintenance_mod, "_CATCH_UP_BUDGET_S", 0.0)  # #1186: one batch per trigger
     try:
         for index in range(600):
             engine._store.append(SESSION, {"role": "user", "content": f"old {index} {FILLER}"})
@@ -1019,8 +1020,9 @@ def test_1063_h_partial_registration_is_completed_by_the_next_pass(
 
 
 def test_automatic_chunks_take_new_messages_before_history_and_history_newest_first(
-    tmp_path, home, providers
+    tmp_path, home, providers, monkeypatch
 ):
+    monkeypatch.setattr(maintenance_mod, "_CATCH_UP_BUDGET_S", 0.0)  # #1186: one batch per trigger
     engine = _make_engine(tmp_path, home)
     db_path = engine._config.database_path
     try:

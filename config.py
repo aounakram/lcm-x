@@ -850,8 +850,8 @@ class LCMConfig:
     # -- Storage ---
     database_path: str = ""       # empty = HERMES_HOME/lcm.db; LCM_DATABASE_PATH may override
 
-    # -- Embeddings (default-off until a provider/model are configured) ---
-    embeddings_enabled: bool = False
+    # -- Embeddings (#1186: local FastEmbed recall is on by default; LCM_EMBEDDINGS_ENABLED=false turns it off) ---
+    embeddings_enabled: bool = True
     # lcm_recall cross-encoder rerank stage over the top fused candidates.
     # Default-off: recall ships value on RRF order alone, and rerank is one extra
     # billable API call the operator opts into. The lite default preserves the
@@ -967,8 +967,8 @@ class LCMConfig:
     # still performs only the provider-free session-bundle path.
     selective_compiler_enabled: bool = False
     selective_compiler_model: str = ""
-    embedding_provider: str = ""
-    embedding_model: str = ""
+    embedding_provider: str = "fastembed"
+    embedding_model: str = "BAAI/bge-small-en-v1.5"
     # Content-aware chunk policy for the raw-history chunk corpus:
     # conversational (default) | heads | full. Unknown values degrade to the
     # default in the chunker's normalize_content_policy.
