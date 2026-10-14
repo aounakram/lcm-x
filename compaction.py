@@ -79,6 +79,84 @@ class CompactionMixin:
                 "LCM leaf chunk has no durable source above the frontier: frontier=%d rows=%d "
                 "first_mapped_store_id=%s", frontier, len(rows), first_mapped,
             )
+            self._log_leaf_head_durability(frontier)
+
+    def _log_leaf_head_durability(self, frontier: int) -> None:
+        try:
+            started = time.monotonic()
+            view = self._current_compress_messages
+            leaf_map = self._current_compress_store_ids_by_message_id or {}
+            start = next((i for i, message in enumerate(view) if message.get("role") != "system"), len(view))
+            end = next((i for i in range(start, len(view)) if leaf_map.get(id(view[i]), 0) > frontier), len(view))
+            head = view[start:end]
+            stored_index = {}
+            scanned = 0
+
+            def index_rows(rows):
+                nonlocal scanned
+                for row in rows:
+                    scanned += 1
+                    for form in self._stored_row_forms(row):
+                        stored_index.setdefault(form, set()).add(int(row["store_id"]))
+
+            after = 0
+            while True:
+                rows = self._store.get_session_messages_after(self._session_id, after_store_id=after, limit=10000)
+                if not rows:
+                    break
+                index_rows(rows)
+                after = int(rows[-1]["store_id"])
+            carry_ranges = self._load_compression_carry_ranges()
+            for source_session_id, range_start, range_end in carry_ranges:
+                cursor = range_start
+                while cursor <= range_end:
+                    rows = self._store.get_range(source_session_id, start_id=cursor, end_id=range_end, limit=10000)
+                    if not rows:
+                        break
+                    index_rows(rows)
+                    cursor = int(rows[-1]["store_id"]) + 1
+            stored_index = {form: sorted(ids) for form, ids in stored_index.items()}
+            counts = Counter()
+            none_roles = Counter()
+            none_max_chars = 0
+            none_first_head_index = None
+            previous_pick = 0
+            for i, message in enumerate(head):
+                if (self._is_context_summary_content(message.get("content"))
+                        or self._generated_context_carrier_remainder(message) is not None
+                        or self._is_replayed_context_scaffold_message(message)
+                        or self._is_registered_folded_tail_message(message)):
+                    counts["generated"] += 1
+                    continue
+                matches = stored_index.get(self._message_replay_identity(message, strip_carrier=False), [])
+                below = [sid for sid in matches if sid <= frontier]
+                if below:
+                    counts["below"] += 1
+                    pick = next((sid for sid in below if sid > previous_pick), None)
+                    if pick is None:
+                        counts["below_unaligned"] += 1
+                    else:
+                        previous_pick = pick
+                elif matches:
+                    counts["above"] += 1
+                else:
+                    counts["none"] += 1
+                    none_roles[message.get("role")] += 1
+                    none_max_chars = max(none_max_chars, len(str(message.get("content"))))
+                    if none_first_head_index is None:
+                        none_first_head_index = i
+            logger.warning(
+                "LCM leaf head durability (diag #1141): frontier=%d view_rows=%d head_rows=%d generated=%d below=%d "
+                "below_unaligned=%d above=%d none=%d none_roles=%s none_max_chars=%d none_first_head_index=%s "
+                "stored_rows_scanned=%d carry_ranges=%d elapsed_ms=%d",
+                frontier, len(view), len(head), counts["generated"], counts["below"], counts["below_unaligned"],
+                counts["above"], counts["none"],
+                ",".join(f"{role}:{count}" for role, count in sorted(none_roles.items())) or "-",
+                none_max_chars, none_first_head_index if none_first_head_index is not None else "-",
+                scanned, len(carry_ranges), int((time.monotonic() - started) * 1000),
+            )
+        except Exception as exc:
+            logger.warning("LCM leaf head durability (diag #1141) failed: %s", type(exc).__name__)
 
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
@@ -1685,6 +1763,7 @@ class CompactionMixin:
 
             if candidate_start < fresh_tail_start:
                 step_started = time.monotonic() if threshold_full_sweep_active else 0.0
+                self._current_compress_messages = working_messages
                 self._current_compress_store_ids_by_message_id = (
                     premapped_store_ids
                     if premapped_store_ids is not None
