@@ -14,9 +14,11 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import hermes_lcm.command as command_mod
 import hermes_lcm.embedding_maintenance as maintenance_mod
 import hermes_lcm.embedding_provider as provider_mod
 import hermes_lcm.tools as lcm_tools
@@ -59,7 +61,7 @@ def _snapshot(config, *, ignore=()) -> str:
 
 # With embeddings off nothing reads the provider or model; an off overlay that leaves them
 # unset now carries the (inert) local defaults.
-INERT_WHEN_OFF = ("embedding_provider", "embedding_model")
+INERT_WHEN_OFF = ("embedding_provider", "embedding_model", "embedding_model_auto")
 
 
 class _FakeFastembed:
@@ -319,9 +321,21 @@ def test_t5_catch_up_drains_across_triggers_without_reembedding(tmp_path, monkey
             )))
             for index in range(total)
         ]
-        # A trigger whose budget allows one batch embeds one batch and leaves the rest.
-        monkeypatch.setattr(maintenance_mod, "_CATCH_UP_BUDGET_S", 0.0, raising=False)
+        # A trigger whose budget allows one batch embeds one batch and leaves the rest
+        # (a controlled clock: each batch takes 1 s against a 0.5 s budget).
+        clock = [0.0]
+        real_summary_run = command_mod._embedding_backfill_summary_run
+
+        def one_second_batch(*args, **kwargs):
+            clock[0] += 1.0
+            return real_summary_run(*args, **kwargs)
+
+        monkeypatch.setattr(maintenance_mod, "_CATCH_UP_BUDGET_S", 0.5, raising=False)
+        monkeypatch.setattr(maintenance_mod, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+        monkeypatch.setattr(command_mod, "_embedding_backfill_summary_run", one_second_batch)
         first = maintenance_mod.run_incremental_embedding_pass(db_path, engine._config)
+        monkeypatch.setattr(maintenance_mod, "time", time)
+        monkeypatch.setattr(command_mod, "_embedding_backfill_summary_run", real_summary_run)
         before = _summary_vectors(db_path)
         assert 0 < len(before) < total, first
 
@@ -458,3 +472,120 @@ def test_t10_eval_live_provider_requires_both_keys(tmp_path, monkeypatch, env):
 
     with pytest.raises(RuntimeError, match=r"^LCM_EMBEDDING_PROVIDER and LCM_EMBEDDING_MODEL are required$"):
         script._load_live_provider()
+
+
+# Round 2 (T11-T14): cross-model review findings.
+def test_t11_auto_paired_model_follows_provider_overrides(tmp_path, monkeypatch):
+    _clear_lcm_env(monkeypatch, tmp_path)
+    given = "BAAI/bge-base-en-v1.5"
+    resolved = []
+    monkeypatch.setattr(lcm_tools, "resolve_provider", lambda config: resolved.append(config) or object())
+
+    # The proactive-recall override (tools.py): copy.copy, then assign the provider.
+    for config, model in ((LCMConfig.from_env(), ""), (LCMConfig(embedding_model=given), given)):
+        lcm_tools._resolve_recall_provider(SimpleNamespace(_config=config), provider_override="voyage")
+        assert (resolved[-1].embedding_provider, resolved[-1].embedding_model) == ("voyage", model)
+        assert config.embedding_provider == "fastembed"  # the engine's own config is untouched
+
+    # dataclasses.replace: an auto-paired model follows the provider there and back ...
+    ollama = dataclasses.replace(LCMConfig(), embedding_provider="ollama")
+    assert ollama.embedding_model == ""
+    assert dataclasses.replace(ollama, embedding_provider="fastembed").embedding_model == MODEL
+    assert dataclasses.replace(LCMConfig.from_env(), embedding_provider="voyage").embedding_model == ""
+    # ... and a given model, from code or the environment, never changes.
+    assert dataclasses.replace(LCMConfig(embedding_model=given), embedding_provider="ollama").embedding_model == given
+    monkeypatch.setenv("LCM_EMBEDDING_MODEL", MODEL)
+    from_env = LCMConfig.from_env()
+    assert dataclasses.replace(from_env, embedding_provider="openai-compatible").embedding_model == MODEL
+    replaced = dataclasses.replace(LCMConfig(), embedding_model=given)
+    assert dataclasses.replace(replaced, embedding_provider="ollama").embedding_model == given
+
+
+def test_t12_one_prepare_thread_per_process(tmp_path, monkeypatch, prepare):
+    lock, gate = threading.Lock(), threading.Event()
+    active, peak = [0], [0]
+
+    def register(config, db_path, *, allow_download):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        gate.wait(5)
+        with lock:
+            active[0] -= 1
+        return {}
+
+    monkeypatch.setattr(command_mod, "_embedding_register_profiles", register)
+    db_path = str(tmp_path / "lcm.db")
+    first, second = LCMConfig(embedding_model=MODEL), LCMConfig(embedding_model="BAAI/bge-base-en-v1.5")
+
+    assert maintenance_mod.start_local_model_prepare(db_path, first) is True
+    admitted = maintenance_mod.start_local_model_prepare(db_path, second)
+    time.sleep(0.2)  # time for a second thread, if one started, to enter the download
+    alive = [t for t in threading.enumerate() if t.name == "lcm-embedding-prepare"]
+    gate.set()
+    _join_prepare()
+    assert admitted is False and len(alive) == 1 and peak[0] == 1
+    assert maintenance_mod.local_model_state(first) == ("present", "")
+    assert maintenance_mod.local_model_state(second) is None
+
+    # The other model is admitted by a later trigger, once the first prepare has finished.
+    assert maintenance_mod.start_local_model_prepare(db_path, second) is True
+    _join_prepare()
+    assert maintenance_mod.local_model_state(second) == ("present", "") and peak[0] == 1
+
+
+def test_t13_no_batch_starts_after_the_catch_up_budget(tmp_path, monkeypatch):
+    clock, starts = [0.0], []
+
+    def corpus(name):
+        def run(*_args, **_kwargs):
+            starts.append((name, clock[0]))
+            clock[0] += 15.0  # each batch takes 15 s against the 20 s budget
+            return {"status": "partial", "embedded": 1, "remaining": 10, "stop_reason": "", "error": None,
+                    "failed": [], "selected": 1, "privacy_withheld": 0, "skipped": []}
+        return run
+
+    class _Conn:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(maintenance_mod, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    monkeypatch.setattr(command_mod, "_embedding_read_connection", lambda _path: _Conn())
+    monkeypatch.setattr(command_mod, "_embedding_current_profile", lambda _conn: {"identity_hash": "x"})
+    monkeypatch.setattr(command_mod, "_chunk_current_profile", lambda _conn: {"identity_hash": "y"})
+    monkeypatch.setattr(provider_mod, "probe_provider_availability", lambda _config: {"available": True})
+    monkeypatch.setattr(command_mod, "_embedding_backfill_summary_run", corpus("summaries"))
+    monkeypatch.setattr(command_mod, "_chunk_backfill_run", corpus("chunks"))
+
+    outcome = maintenance_mod.run_incremental_embedding_pass(str(tmp_path / "lcm.db"), LCMConfig())
+
+    assert starts == [("summaries", 0.0), ("summaries", 15.0)], (outcome, starts)
+    assert outcome == "summaries=partial:2 chunks=deferred"
+
+
+@pytest.mark.parametrize("state, expected", [
+    (("present", ""), "present"),
+    (("preparing", ""), "preparing"),
+    (("unavailable", "network is unreachable"), "unavailable(network is unreachable)"),
+])
+def test_t14_doctor_text_shows_readiness(tmp_path, monkeypatch, fastembed, state, expected):
+    from hermes_lcm.command import handle_lcm_command
+
+    home = _clear_lcm_env(monkeypatch, tmp_path)
+    fastembed(cached=True)
+    engine = _engine(tmp_path, home)
+    db_path = engine._config.database_path
+    try:
+        engine._session_id = SESSION
+        engine.context_length = 200_000
+        engine._dag.add_node(SummaryNode(session_id=SESSION, depth=0, summary="covered", created_at=1.0, latest_at=1.0))
+        maintenance_mod.run_incremental_embedding_pass(db_path, engine._config)
+        engine._dag.add_node(SummaryNode(session_id=SESSION, depth=0, summary="not yet covered",
+                                         created_at=1.0, latest_at=1.0))
+        maintenance_mod._PREPARE[MODEL] = state
+
+        text = handle_lcm_command("doctor", engine)
+
+        assert f"embedding_readiness: model: {expected}; coverage: 1/2 summaries" in text.splitlines()
+    finally:
+        engine.shutdown()

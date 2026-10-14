@@ -3911,6 +3911,7 @@ def _resolve_recall_provider(
         raise TimeoutError("provider resolution deadline exhausted")
     override_config = copy.copy(config)
     override_config.embedding_provider = override
+    override_config.pair_default_embedding_model()  # #1186: an auto-paired model follows the override
     provider = resolve_provider(override_config)
     if deadline is not None and time.monotonic() >= deadline:
         raise TimeoutError("provider resolution deadline exhausted")

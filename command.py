@@ -2007,6 +2007,9 @@ def _doctor_text(engine) -> str:
         if isinstance(detail, str):
             suffix = f" {detail}"
         lines.append(f"embedding_provider_health: {embedding_check['status']}{suffix}")
+        readiness = detail.get("readiness") if isinstance(detail, dict) else None
+        if readiness:
+            lines.append(f"embedding_readiness: {readiness}")  # #1186: model state and coverage
     if issues:
         lines.append(f"issues: {', '.join(issues)}")
     else:

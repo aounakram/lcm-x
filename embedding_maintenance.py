@@ -36,10 +36,13 @@ _STATE_LOCK = threading.Lock()
 _LAST_PASS: dict[str, tuple[float, str]] = {}
 _FAILURES = 0
 _FAILURE_WARNED = False
-# #1186: per-trigger wall-clock budget for the catch-up drain (checked between batches).
+# #1186: per-trigger wall-clock budget for the catch-up drain (checked before each corpus and batch).
 _CATCH_UP_BUDGET_S = 20.0
 # #1186: local model -> (present | preparing | unavailable, reason) for this process.
 _PREPARE: dict[str, tuple[str, str]] = {}
+# #1186: this process's prepare thread; while it is alive no other prepare starts, and another
+# model is admitted by a later trigger.
+_PREPARE_THREAD: threading.Thread | None = None
 
 
 def database_identity(db_path: str | Path) -> str:
@@ -97,19 +100,23 @@ def start_local_model_prepare(db_path: str | Path, config: Any) -> bool:
     The thread runs the warmup path, the only one allowed to download, and
     registers the profiles. Recall never waits on it: until the model is ready
     it serves full text and reports degraded. A failure warns once; the next
-    process start retries.
+    process start retries. Only one prepare runs per process: a model requested
+    while another is preparing is admitted by a later trigger.
     """
+    global _PREPARE_THREAD
     key = _local_model_key(config)
     if key is None:
         return False
     with _STATE_LOCK:
-        if key in _PREPARE:
+        if key in _PREPARE or (_PREPARE_THREAD is not None and _PREPARE_THREAD.is_alive()):
             return False
         _PREPARE[key] = ("preparing", "")
-    threading.Thread(
-        target=_prepare_local_model, args=(key, db_path, config),
-        name="lcm-embedding-prepare", daemon=True,
-    ).start()
+        # Started under the lock, so a concurrent caller sees it alive.
+        _PREPARE_THREAD = threading.Thread(
+            target=_prepare_local_model, args=(key, db_path, config),
+            name="lcm-embedding-prepare", daemon=True,
+        )
+        _PREPARE_THREAD.start()
     return True
 
 
@@ -220,13 +227,18 @@ def _run_pass(db_path: str | Path, config: Any, breaker: Any) -> tuple[str, str 
     failures: list[str] = []
     deadline = time.monotonic() + _CATCH_UP_BUDGET_S
     for name, run in corpora:
+        # No corpus starts after the budget; the next trigger resumes it.
+        if time.monotonic() >= deadline:
+            outcomes.append(f"{name}=deferred")
+            continue
         embedded = 0
         while True:
             result = run()
             if isinstance(result, str) or _corpus_failure(result) is not None:
                 break
             embedded += result["embedded"]
-            # Drain batch by batch; whatever is left resumes on the next trigger.
+            # Drain batch by batch; no batch starts after the budget, and whatever is
+            # left resumes on the next trigger.
             if (not result["embedded"] or not result["remaining"] or result["stop_reason"]
                     or time.monotonic() >= deadline):
                 break

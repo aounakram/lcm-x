@@ -972,7 +972,8 @@ class LCMConfig:
     selective_compiler_model: str = ""
     embedding_provider: str = "fastembed"
     # None = no model given: __post_init__ resolves it to the FastEmbed default when the
-    # provider is fastembed (#1186), else to empty; an explicit "" stays empty.
+    # provider is fastembed (#1186), else to empty; an explicit "" stays empty. A resolved
+    # model follows later provider changes (see embedding_model_auto); a given one never does.
     embedding_model: str | None = None
     # Content-aware chunk policy for the raw-history chunk corpus:
     # conversational (default) | heads | full. Unknown values degrade to the
@@ -1063,13 +1064,23 @@ class LCMConfig:
     # Summariser prompt version (#646): 1 = original prompts and 2x output
     # ceiling; 2 = v2 prompts, focus directives in the policy, 3x ceiling.
     summary_prompt_version: int = 1
+    # #1186: True while embedding_model holds the automatic pairing rather than a given model.
+    # An init field, so dataclasses.replace and copy.copy carry it to the re-pairing.
+    embedding_model_auto: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
-        self._pair_default_embedding_model()
+        self.pair_default_embedding_model()
 
-    def _pair_default_embedding_model(self) -> None:
-        """#1186: the default model applies only with FastEmbed and when no model was given."""
-        if self.embedding_model is None:
+    def pair_default_embedding_model(self) -> None:
+        """#1186: the default model applies only with FastEmbed and when no model was given.
+
+        An automatically paired model follows the provider: call this again after assigning
+        ``embedding_provider`` on a copy (``dataclasses.replace`` runs it itself).
+        """
+        model = self.embedding_model
+        auto = model is None or (self.embedding_model_auto and model in ("", DEFAULT_FASTEMBED_EMBEDDING_MODEL))
+        self.embedding_model_auto = auto
+        if auto:
             provider = str(self.embedding_provider or "").strip().lower()
             fastembed = provider in {"fastembed", "fast-embed"}
             self.embedding_model = DEFAULT_FASTEMBED_EMBEDDING_MODEL if fastembed else ""
@@ -1196,13 +1207,13 @@ class LCMConfig:
 
         # Every other scalar LCM_* override is applied uniformly from the spec.
         # The model starts unresolved and is paired with the env's provider afterwards.
-        c.embedding_model = None
+        c.embedding_model, c.embedding_model_auto = None, False
         for spec in ENV_FIELD_SPECS:
             if spec.name in _SOURCE_TRACKED_ENV_FIELDS:
                 continue
             parser = _PARSER_BY_TYPE[spec.py_type]
             setattr(c, spec.name, parser(spec.env_key, getattr(c, spec.name)))
-        c._pair_default_embedding_model()
+        c.pair_default_embedding_model()
 
         # Pattern-list overrides carry a source sidecar and stay explicit.
         raw_sensitive_patterns = os.environ.get("LCM_SENSITIVE_PATTERNS")
