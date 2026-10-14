@@ -808,6 +808,33 @@ def test_t9_tools_list_honours_disabled_tools_and_production_schemas(monkeypatch
 
 # -- T10: store offline --------------------------------------------------------------
 
+
+@pytest.mark.parametrize("format_bytes", [(1, 2), (2, 1)], ids=["read-byte-wal", "write-byte-wal"])
+def test_t10_mixed_wal_header_without_sidecars_is_offline(fx, monkeypatch, format_bytes):
+    """REGRESSION (read-byte-wal; write-byte-wal is a CONTROL): SQLite takes the WAL path when either
+    header format byte (18, 19) is 2, so a
+    mixed header with no sidecars must also be store_offline and create no file."""
+    reader = make_reader(fx, monkeypatch)
+    ok, is_error, _ = call(reader, "lcm_grep", {"query": "heron"})
+    assert not is_error
+    stop_agents()
+    for suffix in ("wal", "shm"):
+        Path(f"{fx.db}-{suffix}").unlink(missing_ok=True)
+    with open(fx.db, "r+b") as handle:
+        handle.seek(18)
+        original = handle.read(2)
+        handle.seek(18)
+        handle.write(bytes(format_bytes))
+    try:
+        listing = sorted(os.listdir(fx.home))
+        offline, is_error, _ = call(reader, "lcm_grep", {"query": "heron"})
+        assert is_error and offline["error"].startswith("store_offline:")
+        assert sorted(os.listdir(fx.home)) == listing
+    finally:
+        with open(fx.db, "r+b") as handle:
+            handle.seek(18)
+            handle.write(original)
+
 @pytest.mark.parametrize("missing", ["both", "wal", "shm"])
 def test_t10_stopped_store_is_offline_and_reader_creates_no_file(fx, monkeypatch, missing):
     """REGRESSION: writable directory, WAL store, agent stopped and sidecar(s) gone -> store_offline,

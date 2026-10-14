@@ -78,7 +78,9 @@ def wal_sidecars_missing(db_path: str | Path) -> bool:
             header = handle.read(_WAL_HEADER_OFFSET + 2)
     except OSError:
         return False
-    if len(header) < _WAL_HEADER_OFFSET + 2 or header[_WAL_HEADER_OFFSET] != 2:
+    # SQLite takes the WAL path when EITHER format byte (write 18, read 19) is 2 or more,
+    # so a mixed (1, 2) header must count as WAL too.
+    if len(header) < _WAL_HEADER_OFFSET + 2 or max(header[_WAL_HEADER_OFFSET:_WAL_HEADER_OFFSET + 2]) < 2:
         return False  # rollback-journal (or unreadable) store: opens as before
     return not (Path(f"{path}-wal").exists() and Path(f"{path}-shm").exists())
 
