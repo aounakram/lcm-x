@@ -355,4 +355,3 @@ class ReadOnlyVectorStore(_CloseWithoutCheckpoint, VectorStore):
 
     def _init_db(self) -> None:
         self._conn = open_readonly_connection(self.db_path, row_factory=sqlite3.Row)
-
