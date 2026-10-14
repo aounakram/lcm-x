@@ -876,7 +876,7 @@ def test_t10_store_offline_then_recovers(fx, monkeypatch):
     stop_agents()
     for suffix in ("-wal", "-shm"):
         Path(f"{fx.db}{suffix}").unlink(missing_ok=True)
-    os.chmod(fx.home, 0o555)
+    os.chmod(fx.home, 0o500)  # owner read+search only: an unwritable directory
     try:
         offline, is_error, _ = call(reader, "lcm_grep", {"query": "heron"})
         assert is_error and offline["error"].startswith("store_offline:")
@@ -884,7 +884,7 @@ def test_t10_store_offline_then_recovers(fx, monkeypatch):
         again, is_error, _ = call(reader, "lcm_recall", {"query": "heron"})
         assert is_error and again["error"].startswith("store_offline:")
     finally:
-        os.chmod(fx.home, 0o755)
+        os.chmod(fx.home, 0o700)
     writer = MessageStore(fx.db, ingest_protection_config=fx.config, hermes_home=str(fx.home))
     try:
         back, is_error, _ = call(reader, "lcm_grep", {"query": "heron"})
