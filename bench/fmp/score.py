@@ -88,7 +88,7 @@ def quota(calls):
                                              for c in calls)}
 
 
-def score(runs, output, allow_partial=False):
+def score(runs, output, allow_partial=False, pair_across_commits=False):
     output = Path(output)
     arms, manifests, disagreements = {}, {}, []
     for directory in map(Path, runs):
@@ -101,6 +101,8 @@ def score(runs, output, allow_partial=False):
         if len({r["qid"] for r in rows}) != len(rows):
             raise ValueError("duplicate result ids")
         arm = "/".join([manifest["config"], manifest["delivery"], manifest["reader"]])
+        if pair_across_commits:
+            arm += "@" + manifest["lcmx_commit"][:12]
         if arm in arms:
             raise ValueError("duplicate arm")
         arms[arm], manifests[arm] = {r["qid"]: r for r in rows}, manifest
@@ -108,8 +110,14 @@ def score(runs, output, allow_partial=False):
     if not sets or any(ids != sets[0] for ids in sets):
         raise ValueError("paired runs require identical question ids")
     for key in IDENTITY:
+        if pair_across_commits and key == "lcmx_commit":
+            continue
         if len({json.dumps(m.get(key)) for m in manifests.values()}) != 1:
             raise ValueError("paired runs require identical " + key)
+    if pair_across_commits:
+        commits = sorted({m["lcmx_commit"] for m in manifests.values()})
+        if len(commits) < 2:
+            raise ValueError("pairing across commits requires at least 2 distinct lcmx_commit values")
     ran = [{q for q, r in rows.items() if r["status"] != "not_run"} for rows in arms.values()]
     partial = any(ids != ran[0] for ids in ran) or any(m.get("status") == "incomplete" for m in manifests.values())
     if partial and not allow_partial:
@@ -168,6 +176,9 @@ def score(runs, output, allow_partial=False):
         for accuracies in summary["by_type"].values():
             accuracies["primary"] = mean(list(accuracies.values())) if all(v is not None for v in accuracies.values()) else None
     for left, right in itertools.combinations(arms, 2):
+        if pair_across_commits and (manifests[left]["lcmx_commit"] == manifests[right]["lcmx_commit"] or any(
+                manifests[left][key] != manifests[right][key] for key in ("config", "delivery", "reader"))):
+            continue
         # An error in either arm (reader error, budget or tool violation) removes the question
         # from both arms: the paired tests compare answers, not failure rates.
         dropped = {q: invalid(arms[left][q], full) | invalid(arms[right][q], full) for q in sets[0]}
@@ -188,6 +199,8 @@ def score(runs, output, allow_partial=False):
                                                   [sum(x) / len(full) for x in zip(*vectors[right])])}
     report = {"arms": summaries, "paired": comparisons, "bootstrap_resamples": 10_000,
               "claim": "smoke only; invalid rows excluded; scored_n is the accuracy denominator"}
+    if pair_across_commits:
+        report.update(paired_across="lcmx_commit", lcmx_commits=commits)
     report["tokens_500_per_arm"] = {arm: {k: 500 * (s["reader_tokens_per_question"][k] + s["judge_tokens_per_question"][k])
                                           if all(s[t][k] is not None for t in ("reader_tokens_per_question", "judge_tokens_per_question")) else None
                                           for k in ("input_tokens", "output_tokens")} for arm, s in summaries.items()}

@@ -57,6 +57,7 @@ def parser():
     p.add_argument("--spend-ledger", type=Path)
     p.add_argument("--runs", nargs="+", type=Path)
     p.add_argument("--allow-partial", action="store_true", help="score arms with unequal run question sets")
+    p.add_argument("--pair-across-commits", action="store_true", help="score matching arms across LCM-X commits")
     p.add_argument("--allow-dirty", action="store_true", help="run on an LCM-X tree with uncommitted changes")
     return p
 
@@ -173,7 +174,7 @@ def execute(args):
     if not 1 <= args.workers <= 64:
         raise ValueError("invalid worker count")
     if args.command == "score":
-        score(args.runs or [], args.output, args.allow_partial)
+        score(args.runs or [], args.output, args.allow_partial, args.pair_across_commits)
         return
     if not 0 < args.agreement_fraction <= 1:
         raise ValueError("invalid agreement fraction")
