@@ -1415,9 +1415,12 @@ another store is refused with a `foreign_store` error.
 
 Errors:
 
-- `store_offline`: the store cannot be opened read-only because its `-wal`/`-shm`
-  files are gone (Hermes stopped on a system that removes them) and cannot be
-  recreated. Start Hermes; the next call retries.
+- `store_offline`: the store is in WAL mode and its `-wal` or `-shm` file is gone
+  (Hermes stopped on a system that removes them). The server checks this from the
+  database header before opening and does not open the store, because a read-only
+  open would recreate the files. Start Hermes; the next call retries. Residual race:
+  a reader that opens in the instant the agent stops may recreate the two empty
+  coordination files; the agent's next start handles them.
 - `schema_refused`: the store is stamped newer than this plugin, is below schema
   v5, or lacks a required core table. Nothing is opened for write.
 

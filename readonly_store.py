@@ -65,21 +65,26 @@ class StoreOfflineError(RuntimeError):
     """The WAL store cannot be opened read-only right now (its -wal/-shm are absent)."""
 
 
-def wal_files_absent(db_path: str | Path) -> bool:
-    """True for a WAL-mode database whose -wal and -shm files are both gone.
+def wal_sidecars_missing(db_path: str | Path) -> bool:
+    """True for a WAL-mode database (header bytes 18/19 == 2) missing its -wal or -shm file.
 
-    Stock SQLite deletes them when the last connection closes (a stopped Hermes on
-    Linux); a ``mode=ro`` open then fails until a writer recreates them.
+    Read without SQLite: a ``mode=ro`` open of such a store would RECREATE the missing
+    files when the directory is writable (a filesystem write, possibly as the wrong user),
+    or fail when it is not. Stock SQLite deletes both when the last connection closes.
     """
     path = Path(db_path)
-    if Path(f"{path}-wal").exists() or Path(f"{path}-shm").exists():
-        return False
     try:
         with path.open("rb") as handle:
             header = handle.read(_WAL_HEADER_OFFSET + 2)
     except OSError:
         return False
-    return len(header) == _WAL_HEADER_OFFSET + 2 and header[_WAL_HEADER_OFFSET] == 2
+    if len(header) < _WAL_HEADER_OFFSET + 2 or header[_WAL_HEADER_OFFSET] != 2:
+        return False  # rollback-journal (or unreadable) store: opens as before
+    return not (Path(f"{path}-wal").exists() and Path(f"{path}-shm").exists())
+
+
+_OFFLINE_MESSAGE = ("store_offline: the store's -wal/-shm files are absent (Hermes is stopped); "
+                    "start Hermes and retry")
 
 
 def open_readonly_connection(
@@ -87,8 +92,12 @@ def open_readonly_connection(
 ) -> sqlite3.Connection:
     """Open ``file:<abs>?mode=ro`` in autocommit; raise StoreOfflineError for a stopped WAL store.
 
+    The sidecar check runs BEFORE the open, so the reader never creates -wal/-shm. A writer
+    that stops between the check and the open is a residual race (see the operator guide).
     The open is forced with one schema read so a failure surfaces here, not inside a tool.
     """
+    if wal_sidecars_missing(db_path):
+        raise StoreOfflineError(_OFFLINE_MESSAGE)
     conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True, timeout=timeout,
                            isolation_level=None, check_same_thread=False)
     try:
@@ -96,11 +105,8 @@ def open_readonly_connection(
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
     except sqlite3.OperationalError as exc:
         conn.close()
-        if wal_files_absent(db_path):
-            raise StoreOfflineError(
-                "store_offline: the store's -wal/-shm files are absent (Hermes is stopped); "
-                "start Hermes and retry"
-            ) from exc
+        if wal_sidecars_missing(db_path):
+            raise StoreOfflineError(_OFFLINE_MESSAGE) from exc
         raise
     conn.row_factory = row_factory
     return conn

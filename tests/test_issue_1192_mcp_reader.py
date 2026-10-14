@@ -83,6 +83,25 @@ def _hash_provider(monkeypatch):
     retrieval_core._reset_vector_store_pool()
     yield provider
     retrieval_core._reset_vector_store_pool()
+    while _RUNNING_AGENTS:
+        _RUNNING_AGENTS.pop().close()
+
+
+# Idle connections standing in for a running Hermes: they keep the store's -wal/-shm in
+# place (this SQLite deletes both on the last close) and never write.
+_RUNNING_AGENTS: list[sqlite3.Connection] = []
+
+
+def start_agent(db: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db)
+    conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    _RUNNING_AGENTS.append(conn)
+    return conn
+
+
+def stop_agents() -> None:
+    while _RUNNING_AGENTS:
+        _RUNNING_AGENTS.pop().close()
 
 
 # -- fixture store ---------------------------------------------------------------
@@ -197,6 +216,7 @@ def build_store(tmp_path: Path, *, vectors: bool = True, dim: int = DIM, revisio
     payload_dir = home / DEFAULT_LARGE_OUTPUT_DIRNAME
     refs = sorted(p.name for p in payload_dir.iterdir()) if payload_dir.is_dir() else []
     assert len(refs) == 1, refs
+    start_agent(db)
     return Fixture(home, db, config, s1_ids, s2_tool_id, [n1, n2, n3], refs[0])
 
 
@@ -390,14 +410,21 @@ def test_t2_outputs_equal_a_normal_engine_byte_for_byte(fx, monkeypatch):
             # session as its current one (only the payload-session-dependent calls differ).
             current = "s2" if "externalized_ref" in args else ""
             engine._foreground_session_id = current
-            if name == "lcm_expand" and args.get("store_id") == fx.s2_tool_id:
-                continue  # covered by T8: from_current_session differs by design
-            normal = getattr(lcm_tools, name)(normal_args, engine=engine)
+            # The store-id expansion of the s2 externalized row: the normal engine under the
+            # reader's any-session policy, ordinary storage, no current session.
+            any_session = name == "lcm_expand" and args.get("store_id") == fx.s2_tool_id
+            if any_session:
+                engine._reader_any_session = True
+            try:
+                normal = getattr(lcm_tools, name)(normal_args, engine=engine)
+            finally:
+                if any_session:
+                    del engine._reader_any_session
             assert _drop_fields(reader_text) == _drop_fields(normal), name
             compared += 1
     finally:
         engine.shutdown()
-    assert compared == len(sweep(fx)) - 1
+    assert compared == len(sweep(fx))
 
 
 # -- T3: store bytes unchanged; no embedding tables materialized ------------------
@@ -407,11 +434,11 @@ def _sha256(path: Path) -> str:
 
 
 def test_t3_sweep_leaves_store_bytes_unchanged(fx, monkeypatch):
-    """REGRESSION: with no writer, lcm.db hashes the same before and after a full sweep."""
+    """REGRESSION: with no writes (an idle agent holds the store), lcm.db hashes the same after a full sweep."""
     before = _sha256(fx.db)
     reader = make_reader(fx, monkeypatch)
     for name, args in sweep(fx):
-        reader.call(name, args)
+        assert not reader.call(name, args)[1], name
     retrieval_core._reset_vector_store_pool()
     assert _sha256(fx.db) == before
 
@@ -781,16 +808,45 @@ def test_t9_tools_list_honours_disabled_tools_and_production_schemas(monkeypatch
 
 # -- T10: store offline --------------------------------------------------------------
 
-def test_t10_store_offline_then_recovers(fx, monkeypatch):
-    """REGRESSION: a stopped WAL store without -wal/-shm -> store_offline (no crash); a restored
-    writer makes the next call succeed.
-
-    This SQLite build recreates -wal/-shm on a ``mode=ro`` open when the directory is
-    writable; SQLite builds that cannot recreate them are simulated by making the directory unwritable.
-    """
+@pytest.mark.parametrize("missing", ["both", "wal", "shm"])
+def test_t10_stopped_store_is_offline_and_reader_creates_no_file(fx, monkeypatch, missing):
+    """REGRESSION: writable directory, WAL store, agent stopped and sidecar(s) gone -> store_offline,
+    and the directory listing is unchanged (a mode=ro open would recreate them); the agent's
+    restart makes the next call succeed."""
     reader = make_reader(fx, monkeypatch)
     ok, is_error, _ = call(reader, "lcm_grep", {"query": "heron"})
     assert not is_error
+    sidecars = {suffix: Path(f"{fx.db}-{suffix}") for suffix in ("wal", "shm")}
+    saved = {suffix: path.read_bytes() for suffix, path in sidecars.items()}
+    stop_agents()  # the last close; this SQLite removes both sidecars, persistent-WAL builds keep them
+    for suffix, path in sidecars.items():
+        path.unlink(missing_ok=True)
+        if missing != "both" and suffix != missing:
+            path.write_bytes(saved[suffix])  # leave only the named sidecar missing
+    listing = sorted(os.listdir(fx.home))
+    offline, is_error, _ = call(reader, "lcm_grep", {"query": "heron"})
+    assert is_error and offline["error"].startswith("store_offline:")
+    assert offline["store_uuid"] == ok["store_uuid"]
+    again, is_error, _ = call(reader, "lcm_recall", {"query": "heron"})
+    assert is_error and again["error"].startswith("store_offline:")
+    assert sorted(os.listdir(fx.home)) == listing
+    for path in sidecars.values():
+        path.unlink(missing_ok=True)
+    writer = MessageStore(fx.db, ingest_protection_config=fx.config, hermes_home=str(fx.home))
+    try:
+        back, is_error, _ = call(reader, "lcm_grep", {"query": "heron"})
+        assert not is_error and back["total_results"] == ok["total_results"]
+    finally:
+        writer.close()
+
+
+def test_t10_store_offline_then_recovers(fx, monkeypatch):
+    """CONTROL: a stopped WAL store without -wal/-shm in an unwritable directory -> store_offline
+    (no crash); a restored writer makes the next call succeed."""
+    reader = make_reader(fx, monkeypatch)
+    ok, is_error, _ = call(reader, "lcm_grep", {"query": "heron"})
+    assert not is_error
+    stop_agents()
     for suffix in ("-wal", "-shm"):
         Path(f"{fx.db}{suffix}").unlink(missing_ok=True)
     os.chmod(fx.home, 0o555)

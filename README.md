@@ -1005,9 +1005,12 @@ claude mcp add lcm-x -- <hermes-venv-python> <plugin_dir>/scripts/lcm_x_mcp.py \
   tokenizer has loaded. `reader.capabilities` shows optional tables the store
   lacks. Ids may be sent bare or as `<store_uuid>:<id>`; another store's prefix
   is refused.
-- **Offline.** If Hermes is stopped and the store cannot be opened read-only, a
-  call returns a `store_offline` error and the next call retries. A store stamped
-  newer than the plugin, or below schema v5, is refused with `schema_refused`.
+- **Offline.** If Hermes is stopped and the store's `-wal`/`-shm` coordination files
+  are gone, a call returns a `store_offline` error without opening the store (so the
+  reader never creates those files), and the next call retries. A reader that opens
+  in the instant the agent stops may recreate the two empty coordination files; the
+  agent's next start handles them. A store stamped newer than the plugin, or below
+  schema v5, is refused with `schema_refused`.
 
 See the [operator guide](docs/operator-guide.md#use-lcm-x-memory-from-claude-code-read-only)
 for details.
