@@ -65,10 +65,6 @@ class StoreOfflineError(RuntimeError):
     """The WAL store cannot be opened read-only right now (its -wal/-shm are absent)."""
 
 
-def readonly_uri(db_path: str | Path) -> str:
-    return f"{Path(db_path).resolve().as_uri()}?mode=ro"
-
-
 def wal_files_absent(db_path: str | Path) -> bool:
     """True for a WAL-mode database whose -wal and -shm files are both gone.
 
@@ -93,13 +89,8 @@ def open_readonly_connection(
 
     The open is forced with one schema read so a failure surfaces here, not inside a tool.
     """
-    conn = sqlite3.connect(
-        readonly_uri(db_path),
-        uri=True,
-        timeout=timeout,
-        isolation_level=None,
-        check_same_thread=False,
-    )
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True, timeout=timeout,
+                           isolation_level=None, check_same_thread=False)
     try:
         conn.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
         conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
@@ -118,12 +109,14 @@ def open_readonly_connection(
 def store_uuid_for(conn: sqlite3.Connection, db_path: str | Path) -> tuple[str, str]:
     """Return ``(store_uuid, source)``: the stamped id, else one derived from the file identity."""
     stamped = read_store_uuid(conn)
-    if stamped:
-        return stamped, "metadata"
+    return (stamped, "metadata") if stamped else (derived_store_uuid(db_path), "derived")
+
+
+def derived_store_uuid(db_path: str | Path) -> str:
+    """``sha256(realpath, st_dev, st_ino)[:32]`` for a store without the stamp; raises OSError if absent."""
     real = os.path.realpath(db_path)
     stat = os.stat(real)
-    digest = hashlib.sha256(f"{real}\x1f{stat.st_dev}\x1f{stat.st_ino}".encode("utf-8")).hexdigest()
-    return digest[:32], "derived"
+    return hashlib.sha256(f"{real}\x1f{stat.st_dev}\x1f{stat.st_ino}".encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -163,9 +156,7 @@ def check_schema(conn: sqlite3.Connection) -> int:
         raise SchemaRefusedError(f"schema_refused: {health['error']}")
     missing = [name for name in health.get("missing_tables", []) if name not in _OPTIONAL_CORE_TABLES]
     if missing:
-        raise SchemaRefusedError(
-            "schema_refused: required LCM tables are missing: " + ", ".join(missing)
-        )
+        raise SchemaRefusedError("schema_refused: required LCM tables are missing: " + ", ".join(missing))
     return version
 
 
@@ -204,9 +195,8 @@ def probe_capabilities(conn: sqlite3.Connection, db_path: str | Path) -> StoreCa
     conn.execute("BEGIN")
     try:
         version = check_schema(conn)
-        tables = get_existing_table_names(
-            conn, ["summary_node_provenance", "lcm_lifecycle_state", "host_uid_bindings"]
-        )
+        tables = get_existing_table_names(conn, ["summary_node_provenance", "lcm_lifecycle_state",
+                                                 "host_uid_bindings"])
         embeddings = not verify_embedding_schema(conn) and conn.execute(
             "SELECT 1 FROM lcm_embedding_profile WHERE active = 1 AND archived_at IS NULL "
             "AND task = 'summary' LIMIT 1"
@@ -240,26 +230,31 @@ def active_profile_hashes(conn: sqlite3.Connection) -> dict[str, str]:
     return found
 
 
-def _close_without_checkpoint(owner: Any) -> None:
-    conn = getattr(owner, "_conn", None)
-    if conn is not None:
-        conn.close()
-        owner._conn = None
+class _CloseWithoutCheckpoint:
+    """``close``/``__del__`` for the views: release the connection, never checkpoint or clear caches.
+
+    Listed first in each view's bases so it overrides the stock checkpointing pair, which
+    otherwise still fires on constructor-free instances and on every ``copy.copy``.
+    """
+
+    def close(self) -> None:
+        conn = getattr(self, "_conn", None)
+        if conn is not None:
+            conn.close()
+            self._conn = None
+
+    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
-class ReadOnlyMessageStore(MessageStore):
+class ReadOnlyMessageStore(_CloseWithoutCheckpoint, MessageStore):
     """MessageStore fields over a caller-owned ``mode=ro`` connection; no constructor writes."""
 
-    def __init__(
-        self,
-        db_path: str | Path,
-        conn: sqlite3.Connection,
-        *,
-        config: LCMConfig,
-        hermes_home: str,
-        stem_usable: bool,
-        fts_usable: bool = True,
-    ) -> None:
+    def __init__(self, db_path: str | Path, conn: sqlite3.Connection, *, config: LCMConfig,
+                 hermes_home: str, stem_usable: bool, fts_usable: bool = True) -> None:
         self.db_path = Path(db_path)
         self._ingest_protection_config = config
         self._hermes_home = hermes_home
@@ -290,27 +285,12 @@ class ReadOnlyMessageStore(MessageStore):
             exclude_session_ids=exclude_session_ids,
         )
 
-    def close(self) -> None:
-        _close_without_checkpoint(self)
 
-    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-class ReadOnlySummaryDAG(SummaryDAG):
+class ReadOnlySummaryDAG(_CloseWithoutCheckpoint, SummaryDAG):
     """SummaryDAG fields over a caller-owned ``mode=ro`` connection; no constructor writes."""
 
-    def __init__(
-        self,
-        db_path: str | Path,
-        conn: sqlite3.Connection,
-        *,
-        fts_usable: bool = True,
-        provenance_table: bool = True,
-    ) -> None:
+    def __init__(self, db_path: str | Path, conn: sqlite3.Connection, *, fts_usable: bool = True,
+                 provenance_table: bool = True) -> None:
         self.db_path = Path(db_path)
         self._conn = conn
         self._db_lock = threading.RLock()
@@ -333,17 +313,8 @@ class ReadOnlySummaryDAG(SummaryDAG):
             return None
         return super().get_node_provenance(node_id)
 
-    def close(self) -> None:
-        _close_without_checkpoint(self)
 
-    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-class ReadOnlyLifecycleStateStore(LifecycleStateStore):
+class ReadOnlyLifecycleStateStore(_CloseWithoutCheckpoint, LifecycleStateStore):
     """Lifecycle reads over a caller-owned ``mode=ro`` connection (row factory as production)."""
 
     def __init__(self, db_path: str | Path, conn: sqlite3.Connection) -> None:
@@ -351,17 +322,8 @@ class ReadOnlyLifecycleStateStore(LifecycleStateStore):
         self._conn = conn
         self._lock = threading.RLock()
 
-    def close(self) -> None:
-        _close_without_checkpoint(self)
 
-    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
-        try:
-            self.close()
-        except Exception:
-            pass
-
-
-class ReadOnlyVectorStore(VectorStore):
+class ReadOnlyVectorStore(_CloseWithoutCheckpoint, VectorStore):
     """A poolable VectorStore whose construction and close never write the store.
 
     Field for field the stock ``__init__`` minus the parent ``mkdir`` and the write-path
@@ -372,26 +334,14 @@ class ReadOnlyVectorStore(VectorStore):
 
     _supports_pooling = True
 
-    def __init__(
-        self,
-        db_path: str | Path,
-        *,
-        config: LCMConfig | None = None,
-        bounded_scan_rows: int | None = None,
-    ) -> None:
+    def __init__(self, db_path: str | Path, *, config: LCMConfig | None = None,
+                 bounded_scan_rows: int | None = None) -> None:
         self.db_path = Path(db_path)
         resolved_config = config or LCMConfig.from_env()
-        self.bounded_scan_rows = (
-            resolved_config.embedding_bounded_scan_rows
-            if bounded_scan_rows is None
-            else int(bounded_scan_rows)
-        )
-        self.knn_prescreen_multiplier = max(
-            1, int(getattr(resolved_config, "knn_prescreen_multiplier", 4) or 4)
-        )
-        self._write_binary_prescreen = bool(
-            getattr(resolved_config, "embedding_binary_prescreen", False)
-        )
+        self.bounded_scan_rows = (resolved_config.embedding_bounded_scan_rows if bounded_scan_rows is None
+                                  else int(bounded_scan_rows))
+        self.knn_prescreen_multiplier = max(1, int(getattr(resolved_config, "knn_prescreen_multiplier", 4) or 4))
+        self._write_binary_prescreen = bool(getattr(resolved_config, "embedding_binary_prescreen", False))
         self._conn = None
         self._write_lock = threading.RLock()
         self._cache_lock = threading.RLock()
@@ -405,13 +355,4 @@ class ReadOnlyVectorStore(VectorStore):
 
     def _init_db(self) -> None:
         self._conn = open_readonly_connection(self.db_path, row_factory=sqlite3.Row)
-
-    def close(self) -> None:
-        _close_without_checkpoint(self)
-
-    def __del__(self) -> None:  # pragma: no cover - defensive resource cleanup
-        try:
-            self.close()
-        except Exception:
-            pass
 

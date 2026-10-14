@@ -42,6 +42,7 @@ from .readonly_store import (
     SchemaRefusedError,
     StoreOfflineError,
     active_profile_hashes,
+    derived_store_uuid,
     open_readonly_connection,
     probe_capabilities,
     store_uuid_for,
@@ -109,9 +110,7 @@ def read_profile_env(hermes_home: str | Path) -> dict[str, str]:
     return found
 
 
-def apply_profile_environment(
-    hermes_home: str | Path, environ: MutableMapping[str, str] | None = None
-) -> list[str]:
+def apply_profile_environment(hermes_home: str | Path, environ: MutableMapping[str, str] | None = None) -> list[str]:
     """Make this dedicated process's environment the profile's LCM view; return the keys set.
 
     The reader's own ``LCM_*`` values (``LCM_HERMES_BASE_DIR`` included) are dropped first:
@@ -133,15 +132,9 @@ def disabled_tool_names(environ: MutableMapping[str, str] | None = None) -> set[
 
 
 def tool_definitions(disabled: set[str]) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": name,
-            "description": schema.get("description", "") + READER_NOTE,
-            "inputSchema": schema.get("parameters") or {"type": "object", "properties": {}},
-        }
-        for name, schema in READER_TOOLS.items()
-        if name not in disabled
-    ]
+    return [{"name": name, "description": schema.get("description", "") + READER_NOTE,
+             "inputSchema": schema.get("parameters") or {"type": "object", "properties": {}}}
+            for name, schema in READER_TOOLS.items() if name not in disabled]
 
 
 # -- Engine shim ----------------------------------------------------------------
@@ -257,22 +250,15 @@ class StoreReader:
         dtype = _resolve_storage_dtype(cfg)
         dim = _resolve_store_dim(cfg, len(vector))
         # The same revision rule the writer's register_profile applies (prescreen tag).
-        revision = VectorStore._prescreen_revision(
-            SimpleNamespace(_write_binary_prescreen=bool(getattr(cfg, "embedding_binary_prescreen", False))),
-            "", dtype=dtype,
-        )
+        prescreen = SimpleNamespace(_write_binary_prescreen=bool(getattr(cfg, "embedding_binary_prescreen", False)))
+        revision = VectorStore._prescreen_revision(prescreen, "", dtype=dtype)
         provider_id, model_id = str(provider.provider_id), str(provider.model_id)
-
-        def identity(task: str) -> str:
-            return EmbeddingIdentity.canonical(
-                provider_id, model_id, revision, dim, dtype, _VECTOR_BYTEORDER, task
-            ).identity_hash
-
-        chunk_same_model = embedding_provider.default_chunk_model(provider_id, model_id) == model_id
-        self._expected_identity = {
-            "summary": identity("summary"),
-            "chunk": identity("chunk") if chunk_same_model else None,
-        }
+        expected = {task: EmbeddingIdentity.canonical(provider_id, model_id, revision, dim, dtype,
+                                                      _VECTOR_BYTEORDER, task).identity_hash
+                    for task in ("summary", "chunk")}
+        if embedding_provider.default_chunk_model(provider_id, model_id) != model_id:
+            expected["chunk"] = None  # a separate chunk model is a cloud (Voyage) path: never matched
+        self._expected_identity = expected
         self._provider = provider
 
     def _embedding_gate(self, conn: sqlite3.Connection) -> tuple[bool, list[str]]:
@@ -315,33 +301,20 @@ class StoreReader:
                 config.embeddings_enabled = False
             engine = ReaderEngine(
                 config=config,
-                store=ReadOnlyMessageStore(
-                    self.store_path, store_conn, config=config, hermes_home=self.hermes_home,
-                    stem_usable=caps.stem, fts_usable=caps.fts_messages,
-                ),
-                dag=ReadOnlySummaryDAG(
-                    self.store_path, dag_conn, fts_usable=caps.fts_nodes,
-                    provenance_table=caps.summary_node_provenance,
-                ),
-                hermes_home=self.hermes_home,
-                lifecycle=lifecycle,
-                provider_caches=self._provider_caches,
+                store=ReadOnlyMessageStore(self.store_path, store_conn, config=config, hermes_home=self.hermes_home,
+                                           stem_usable=caps.stem, fts_usable=caps.fts_messages),
+                dag=ReadOnlySummaryDAG(self.store_path, dag_conn, fts_usable=caps.fts_nodes,
+                                       provenance_table=caps.summary_node_provenance),
+                hermes_home=self.hermes_home, lifecycle=lifecycle, provider_caches=self._provider_caches,
             )
-            if vectors_on:
+            if vectors_on:  # the cache key _lcm_grep_resolve_provider computes from this config
                 engine._lcm_embedding_provider_cache = (
-                    (
-                        str(getattr(config, "embedding_provider", "") or "").strip().lower(),
-                        str(getattr(config, "embedding_model", "") or "").strip(),
-                    ),
+                    (str(getattr(config, "embedding_provider", "") or "").strip().lower(),
+                     str(getattr(config, "embedding_model", "") or "").strip()),
                     self._provider,
                 )
-            context = {
-                "store_uuid": store_uuid,
-                "store_uuid_source": uuid_source,
-                "degraded": degraded,
-                "capabilities": caps.as_flags(),
-            }
-            yield engine, context
+            yield engine, {"store_uuid": store_uuid, "store_uuid_source": uuid_source,
+                           "degraded": degraded, "capabilities": caps.as_flags()}
         finally:
             if engine is not None:
                 for name in ("_lcm_embedding_provider_cache", "_lcm_proactive_provider_cache",
@@ -376,12 +349,9 @@ class StoreReader:
         if self._last_uuid is not None:
             return self._last_uuid
         try:
-            real = os.path.realpath(self.store_path)
-            stat = os.stat(real)
+            return derived_store_uuid(self.store_path), "derived"
         except OSError:
             return "", "unknown"
-        digest = hashlib.sha256(f"{real}\x1f{stat.st_dev}\x1f{stat.st_ino}".encode("utf-8")).hexdigest()
-        return digest[:32], "derived"
 
     def envelope(self, raw: str, context: dict[str, Any] | None) -> str:
         """Prefix the production JSON object with ``store_uuid`` and the reader flags.
@@ -435,15 +405,10 @@ class StoreReader:
         except (TypeError, ValueError):
             is_error = False
         text = self.envelope(raw, context)
-        logger.info("%s", json.dumps({
-            "tool": str(name),
-            "args_sha256": hashlib.sha256(
-                json.dumps(arguments, sort_keys=True, default=str).encode("utf-8")
-            ).hexdigest(),
-            "is_error": is_error,
-            "latency_s": round(time.monotonic() - started, 4),
-            "output_bytes": len(text.encode("utf-8")),
-        }))
+        args_hash = hashlib.sha256(json.dumps(arguments, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        logger.info("%s", json.dumps({"tool": str(name), "args_sha256": args_hash, "is_error": is_error,
+                                      "latency_s": round(time.monotonic() - started, 4),
+                                      "output_bytes": len(text.encode("utf-8"))}))
         return text, is_error
 
 
@@ -508,10 +473,9 @@ def serve(reader: StoreReader, stdin: TextIO, stdout: TextIO) -> None:
 def _plugin_version() -> str:
     try:
         text = (Path(__file__).resolve().parent / "plugin.yaml").read_text(encoding="utf-8")
-    except OSError:
+        return re.search(r"^version:\s*['\"]?([^'\"\s]+)", text, re.MULTILINE).group(1)
+    except (OSError, AttributeError):
         return "unknown"
-    match = re.search(r"^version:\s*['\"]?([^'\"\s]+)", text, re.MULTILINE)
-    return match.group(1) if match else "unknown"
 
 
 def _isolate_stdio(log_path: Path) -> TextIO:
