@@ -265,7 +265,7 @@ def _run_pass(db_path: str | Path, config: Any, breaker: Any) -> tuple[str, str 
                 if (retry or not result["embedded"] or not result["remaining"] or result["stop_reason"]
                         or time.monotonic() >= deadline):
                     break
-            if isinstance(result, str) or result["status"] == "error":
+            if isinstance(result, str) or _corpus_failure(result) is not None:
                 break
         if isinstance(result, str):
             if getattr(result, "reason", "") == "lease_held":

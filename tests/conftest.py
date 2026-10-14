@@ -104,6 +104,7 @@ def _no_background_model_prepare():
         provider = sys.modules.get("hermes_lcm.embedding_provider")
         if provider is not None:
             monkeypatch.setattr(provider, "_FASTEMBED_MODELS", {}, raising=False)
+            monkeypatch.setattr(provider, "_FASTEMBED_BUILD_LOCKS", {}, raising=False)
         if maintenance is not None:
             monkeypatch.setattr(maintenance, "_PREPARE", {})
             monkeypatch.setattr(maintenance, "_PREPARE_THREAD", None, raising=False)

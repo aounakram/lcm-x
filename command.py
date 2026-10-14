@@ -5059,7 +5059,7 @@ def _chunk_gapfill_rows(conn, identity_hash, bounds, policy, limit, *, record_pr
     roles = "'assistant', 'user', 'tool'" if policy == "heads" else "'assistant', 'user'"
     rows = conn.execute(
         f"SELECT store_id, role, content FROM messages AS m "
-        f"WHERE store_id >= ? AND store_id <= ? AND store_id < ? "
+        f"WHERE store_id > ? AND store_id < ? AND store_id < ? "
         f"AND lower(trim(role)) IN ({roles}) AND trim(COALESCE(content, '')) != '' "
         "AND NOT EXISTS (SELECT 1 FROM lcm_chunk_meta AS c "
         "WHERE c.store_id = m.store_id AND c.identity_hash = ?) "

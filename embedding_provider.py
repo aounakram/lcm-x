@@ -77,6 +77,8 @@ _DEFAULT_FASTEMBED_CACHE = Path.home() / ".cache" / "fastembed"
 _FASTEMBED_THREADS = 2
 _FASTEMBED_MODEL_LOCK = threading.RLock()
 _FASTEMBED_MODELS: dict[tuple[str, str, int], Any] = {}
+# Cached-only loads never wait for a download of the same key.
+_FASTEMBED_BUILD_LOCKS: dict[tuple[tuple[str, str, int], bool], Any] = {}
 _LOCAL_EMBED_MAX_WORKERS = 4
 _LOCAL_EMBED_WORKER_SLOTS = threading.BoundedSemaphore(_LOCAL_EMBED_MAX_WORKERS)
 
@@ -1810,11 +1812,13 @@ class FastembedProvider(_ResilientProvider):
         return self._dim
 
     def _construct(self, *, allow_download: bool) -> Any:
+        key = self._cache_key()
         with _FASTEMBED_MODEL_LOCK:
-            key = self._cache_key()
-            if key not in _FASTEMBED_MODELS:
-                _FASTEMBED_MODELS[key] = self._construct_uncached(allow_download=allow_download)
-            return _FASTEMBED_MODELS[key]
+            if key in _FASTEMBED_MODELS:
+                return _FASTEMBED_MODELS[key]
+        model = self._construct_uncached(allow_download=allow_download)
+        with _FASTEMBED_MODEL_LOCK:
+            return _FASTEMBED_MODELS.setdefault(key, model)
 
     def _cache_key(self) -> tuple[str, str, int]:
         return self.model_id, str(self.cache_dir.resolve()), _FASTEMBED_THREADS
@@ -1845,13 +1849,18 @@ class FastembedProvider(_ResilientProvider):
 
     def _ensure_local(self, *, allow_download: bool = False) -> Any:
         if self._model is None:
-            # Construction/publication is serialized; encoding never holds this
-            # lock, so a query that outlives its deadline cannot block backfill.
+            key = self._cache_key()
             with _FASTEMBED_MODEL_LOCK:
-                key = self._cache_key()
-                if key not in _FASTEMBED_MODELS:
-                    _FASTEMBED_MODELS[key] = self._construct(allow_download=allow_download)
-                self._model = _FASTEMBED_MODELS[key]
+                build_lock = _FASTEMBED_BUILD_LOCKS.setdefault((key, allow_download), threading.Lock())
+            # Serialize each construction mode outside the cache lock. Queries
+            # load cached files only, independently of a warmup's network I/O.
+            with build_lock:
+                with _FASTEMBED_MODEL_LOCK:
+                    model = _FASTEMBED_MODELS.get(key)
+                if model is None:
+                    model = self._construct(allow_download=allow_download)
+                with _FASTEMBED_MODEL_LOCK:
+                    self._model = _FASTEMBED_MODELS.setdefault(key, model)
         return self._model
 
     def _embed(
