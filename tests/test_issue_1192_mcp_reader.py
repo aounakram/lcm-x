@@ -729,6 +729,22 @@ def test_t9_protocol_session_over_stdio(spawned_fx, tmp_path):
     assert '"tool": "lcm_grep"' in log_text
 
 
+def test_t9_replies_arrive_line_by_line_before_stdin_closes(spawned_fx, tmp_path):
+    """REGRESSION: an MCP client waits for each reply; the server answers without more input."""
+    proc, _ = _spawn(spawned_fx, tmp_path)
+    try:
+        for ident, line in enumerate([_req(1, "initialize", {"protocolVersion": "2025-06-18"}),
+                                      _req(2, "tools/call", {"name": "lcm_grep", "arguments": {"query": "heron"}})],
+                                     start=1):
+            proc.stdin.write(line + "\n")
+            proc.stdin.flush()
+            reply = json.loads(proc.stdout.readline())
+            assert reply["id"] == ident and "result" in reply
+    finally:
+        proc.stdin.close()
+        assert proc.wait(timeout=60) == 0
+
+
 def test_t9_launcher_never_imports_the_engine(tmp_path):
     """REGRESSION: the launcher bootstrap reaches mcp_reader without hermes_lcm.engine or __init__."""
     probe = (
