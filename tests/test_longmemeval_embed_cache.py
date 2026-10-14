@@ -204,7 +204,6 @@ def test_prewarm_changed_manifest_truncates_to_current_scan(tmp_path, monkeypatc
     assert dry_run["privacy"]["changed"] == real_run["privacy"]["changed"] == 1
 
 
-
 def test_cache_file_is_stable_once_a_call_returns(tmp_path, monkeypatch):
     """REGRESSION (#1215 CI): every cache call closes its connection, so the WAL is checkpointed when the call
     returns, not later when the garbage collector finalizes a leaked connection."""
@@ -225,6 +224,7 @@ def test_cache_file_is_stable_once_a_call_returns(tmp_path, monkeypatch):
         gc.enable()
     gc.collect()
     assert cache_path.read_bytes() == before
+
 
 def test_prewarm_refuses_changed_manifest_that_aliases_the_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
