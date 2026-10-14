@@ -95,6 +95,9 @@ from .embedding_provider import (
     _plan_contextualized_requests,
     default_chunk_model,
     fastembed_download_size_note,
+    local_reranker,
+    rerank_readiness,
+    rerank_selection,
     resolve_provider,
 )
 from .tokens import count_tokens
@@ -2007,6 +2010,7 @@ def _doctor_text(engine) -> str:
         if isinstance(detail, str):
             suffix = f" {detail}"
         lines.append(f"embedding_provider_health: {embedding_check['status']}{suffix}")
+        lines.append(f"rerank: {embedding_check.get('rerank', 'unknown')}")
     if issues:
         lines.append(f"issues: {', '.join(issues)}")
     else:
@@ -3166,10 +3170,15 @@ def _embedding_register_profiles(config, db_path, *, allow_download: bool) -> st
 def _embedding_warmup_text(engine) -> str:
     """Warm and dimension-lock both summary and chunk vector profiles."""
     try:
+        rerank_provider, rerank_model = rerank_selection(engine._config)
+        local_rerank = engine._config.rerank_enabled and rerank_provider == "fastembed"
+        if local_rerank:
+            local_reranker(rerank_model).warmup()
         result = _embedding_register_profiles(engine._config, engine._store.db_path, allow_download=True)
         if isinstance(result, dict):
             engine._lcm_embedding_provider_cache = result["provider_cache"]
-        return result["text"] if isinstance(result, dict) else result
+        text = result["text"] if isinstance(result, dict) else result
+        return text + f"\nrerank: {rerank_readiness(engine._config)}" if local_rerank else text
     except Exception as exc:
         return "\n".join(["LCM embedding warmup", "status: error", f"error: {exc}"])
 
