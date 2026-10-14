@@ -529,23 +529,27 @@ def test_t5_full_store_reports_all_capabilities(fx, monkeypatch):
 # -- T6: the writer's checkpoints keep progressing --------------------------------
 
 def test_t6_writer_checkpoints_never_busy_across_50_calls(fx, monkeypatch):
-    """REGRESSION: after each of 50 reader calls a writer commit + PASSIVE checkpoint reports busy == 0."""
+    """REGRESSION: after each of 50 reader calls a writer commit + PASSIVE checkpoint reports busy == 0
+    and checkpoints every WAL frame (a reader snapshot left open would hold frames back)."""
     reader = make_reader(fx, monkeypatch)
     store = MessageStore(fx.db, ingest_protection_config=fx.config, hermes_home=str(fx.home))
-    busy_counts = []
+    busy_counts, lagging = [], []
     try:
         plan = sweep(fx)
         for index in range(50):
             name, args = plan[index % len(plan)]
             reader.call(name, args)
             store.append("s9", {"role": "user", "content": f"checkpoint probe {index}"})
-            busy, _log, _done = store._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            busy, log_frames, checkpointed = store._conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
             busy_counts.append(busy)
+            if checkpointed != log_frames:
+                lagging.append((index, name, log_frames, checkpointed))
     finally:
         store.close()
     assert any(isinstance(e["store"], _reader_modules()[1].ReadOnlyVectorStore)
                for e in retrieval_core._vector_store_pool.values())
     assert busy_counts == [0] * 50
+    assert lagging == []
 
 
 # -- T7: full-identity gate --------------------------------------------------------
