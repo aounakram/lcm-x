@@ -7,6 +7,7 @@ Every fixture is a v5 store built in ``tmp_path`` through the real write API.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import math
@@ -325,6 +326,10 @@ def test_t1_full_sweep_makes_zero_main_database_writes(fx, monkeypatch):
     assert len(denials.opened) >= 3 * len(results)  # per-call ro connections were audited
     assert any(isinstance(entry["store"], _reader_modules()[1].ReadOnlyVectorStore)
                for entry in retrieval_core._vector_store_pool.values())
+    # Teardown is part of the sweep: pooled-store close and every finalizer run under audit.
+    retrieval_core._reset_vector_store_pool()
+    del reader
+    gc.collect()
     assert denials == []
 
 
