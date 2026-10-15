@@ -86,7 +86,18 @@ def test_unknown_cold_identity_defers_then_publishes_and_expands(
             "cold-regression", platform="discord",
             conversation_id="gateway-regression", context_length=200000,
         )
-        engine.ingest(HISTORY)
+        # Retry the actual host post-turn hook after normal session startup.
+        # The host still omits identity; the resident registry binding proves it.
+        hook = _hook_for(engine)
+        hook(**payload)
+        rows = engine._store.get_range("cold-regression")
+        first_ids = [row["store_id"] for row in rows]
+        assert [row["content"] for row in rows] == [m["content"] for m in HISTORY]
+        hook(**payload)
+        assert [row["store_id"] for row in engine._store.get_range("cold-regression")] == first_ids
+        # Explicit identity must find the same engine and not duplicate history.
+        hook(**dict(payload, conversation_id="gateway-regression"))
+        assert [row["store_id"] for row in engine._store.get_range("cold-regression")] == first_ids
         rows = engine._store.get_range("cold-regression")
         assert len(rows) == len(HISTORY)
         assert all(row["conversation_id"] == "gateway-regression" for row in rows)
@@ -94,6 +105,9 @@ def test_unknown_cold_identity_defers_then_publishes_and_expands(
         assert engine.last_compression_status == "compacted"
         nodes = engine._dag.get_session_nodes("cold-regression")
         assert len(nodes) == 1
+        assert nodes[0].source_ids == first_ids[:2]
+        assert len(nodes[0].source_ids) == len(set(nodes[0].source_ids))
+        assert [row["store_id"] for row in engine._store.get_range("cold-regression")] == first_ids
         lifecycle = engine._lifecycle.get_by_conversation("gateway-regression")
         assert lifecycle.current_frontier_store_id == 2
         expanded = engine.handle_tool_call("lcm_expand", {"node_id": nodes[0].node_id})
